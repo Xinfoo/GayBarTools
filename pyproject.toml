@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaybar-tools"
+version = "0.1.0"
+description = "学习通章节学习桌面助手"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.56,<2"]
+
+[project.scripts]
+gaybar-tools = "gaybar_tools.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["gaybar_tools*"]
+
+[tool.setuptools.package-data]
+gaybar_tools = ["demo/*.html", "demo/*.webm", "demo/*.css", "demo/*.js"]
