@@ -18,7 +18,6 @@ class AppSettings:
     ocr: bool = False
     ocr_languages: str = "chi_sim+eng"
     request_timeout: float = 45.0
-    confidence_threshold: float = 0.75
     browser_path: str = ""
     action_delay_min: float = 0.35
     action_delay_max: float = 1.0
@@ -41,7 +40,7 @@ class AppSettings:
         if require_model and not self.model.strip():
             raise ValueError("请填写服务商提供的模型名称。")
         for name, low, high in (
-            ("request_timeout", 1, 300), ("confidence_threshold", 0, 1),
+            ("request_timeout", 1, 300),
             ("action_delay_min", 0, 10), ("action_delay_max", 0, 20),
             ("poll_interval", 0.05, 60), ("video_timeout", 1, 86400),
             ("max_chapters", 1, 10000),

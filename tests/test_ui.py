@@ -43,7 +43,7 @@ class StartButtonTests(unittest.TestCase):
             name: Value(getattr(self.app.settings, name))
             for name in (
                 "base_url", "model", "api_key", "vision", "ocr",
-                "remember_key", "browser_path", "confidence_threshold",
+                "remember_key", "browser_path",
                 "max_chapters", "auto_submit",
             )
         }

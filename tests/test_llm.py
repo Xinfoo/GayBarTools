@@ -22,8 +22,8 @@ def make_question(question_id="q1", kind="single"):
     return Question(question_id, "Which statements are true?", kind, (Option("A", "First"), Option("B", "Second")))
 
 
-def answer(question_id="q1", choices=None, confidence=0.95):
-    return {"question_id": question_id, "choices": choices if choices is not None else ["A"], "confidence": confidence}
+def answer(question_id="q1", choices=None):
+    return {"question_id": question_id, "choices": choices if choices is not None else ["A"]}
 
 
 def api_response(content, **choice_fields):
@@ -65,7 +65,7 @@ class QuizSolverTests(unittest.TestCase):
         content = payload["messages"][1]["content"]
         self.assertIn("Which statements are true?", content[0]["text"])
         self.assertEqual(content[1]["image_url"]["url"], "data:image/png;base64," + base64.b64encode(PNG).decode())
-        self.assertEqual(result[0].confidence, 0.95)
+        self.assertEqual(result[0].choices, ("A",))
         self.assertNotIn("response_format", payload)
 
     def test_key_is_sent_in_header_but_not_logged(self):
@@ -113,12 +113,6 @@ class QuizSolverTests(unittest.TestCase):
             (json.dumps({"answers": [answer(choices=["C"])]}), "未知选项"),
             (json.dumps({"answers": [answer(choices=["A", "A"])]}), "重复选项"),
             (json.dumps({"answers": [answer(choices=["A", "B"])]}), "只能选择一个"),
-            (json.dumps({"answers": [answer(confidence=True)]}), "无效置信度"),
-            (json.dumps({"answers": [answer(confidence="0.9")]}), "无效置信度"),
-            (json.dumps({"answers": [answer(confidence=-0.1)]}), "无效置信度"),
-            (json.dumps({"answers": [answer(confidence=1.1)]}), "无效置信度"),
-            (json.dumps({"answers": [answer(confidence=float("nan"))]}), "无效置信度"),
-            (json.dumps({"answers": [answer(confidence=0.2)]}), "低于"),
             (json.dumps({"answers": [{**answer(), "reason": []}]}), "解释格式"),
         ]
         for content, expected in invalid:
@@ -130,9 +124,17 @@ class QuizSolverTests(unittest.TestCase):
         with self.assertRaisesRegex(SolverError, "遗漏"):
             self.solve_with([answer()], [make_question(), make_question("q2")])
 
-    def test_threshold_boundary_is_accepted(self):
-        result, _ = self.solve_with([answer(confidence=self.settings.confidence_threshold)])
-        self.assertEqual(result[0].confidence, self.settings.confidence_threshold)
+    def test_answers_need_no_confidence_and_prompt_does_not_request_it(self):
+        result, mocked = self.solve_with([answer()])
+        self.assertEqual(result[0].choices, ("A",))
+        prompt = json.loads(mocked.call_args.args[0].data)["messages"][0]["content"]
+        self.assertNotIn("confidence", prompt.lower())
+
+    def test_legacy_confidence_metadata_cannot_block_valid_answers(self):
+        for confidence in (0, 0.2, None, True, "unknown", -1, 1.1, float("nan"), {}):
+            with self.subTest(confidence=confidence):
+                result, _ = self.solve_with([{**answer(), "confidence": confidence}])
+                self.assertEqual(result[0].choices, ("A",))
 
     def test_bad_dom_is_rejected_before_network(self):
         invalid_questions = [
@@ -164,7 +166,7 @@ class QuizSolverTests(unittest.TestCase):
             self.solver.solve([make_question()], PNG)
 
     def test_bad_settings_rejected_before_network(self):
-        for field, value in [("model", ""), ("request_timeout", 0), ("confidence_threshold", 2), ("api_key", "bad\nkey")]:
+        for field, value in [("model", ""), ("request_timeout", 0), ("api_key", "bad\nkey")]:
             with self.subTest(field=field):
                 original = getattr(self.settings, field)
                 setattr(self.settings, field, value)

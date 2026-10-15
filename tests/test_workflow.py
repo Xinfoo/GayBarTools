@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -27,10 +28,20 @@ class SettingsTests(unittest.TestCase):
 
     def test_bad_settings_fail_before_browser_launch(self):
         for values in ({"base_url": 3}, {"request_timeout": float("nan")},
-                       {"vision": "false"}, {"confidence_threshold": 1.1},
+                       {"vision": "false"},
                        {"max_chapters": 2.5}, {"base_url": "https://u:p@example.test/v1"}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 AppSettings(**values).validate()
+
+    def test_legacy_confidence_setting_is_ignored_and_removed_on_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(json.dumps({"model": "existing-model", "confidence_threshold": 1.1}))
+            settings = AppSettings.load(path)
+            self.assertEqual(settings.model, "existing-model")
+            self.assertFalse(hasattr(settings, "confidence_threshold"))
+            settings.save(path)
+            self.assertNotIn("confidence_threshold", json.loads(path.read_text()))
 
     def test_paths_and_child_cache_stay_under_project(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -69,7 +80,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.submit_quiz.return_value = True
         self.browser.next_chapter.return_value = False
         self.solver = Mock()
-        self.solver.solve.return_value = [Answer("q", ("A",), 0.9)]
+        self.solver.solve.return_value = [Answer("q", ("A",))]
         self.settings = AppSettings(model="test")
 
     def workflow(self):
@@ -82,7 +93,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.next_chapter.assert_not_called()
 
     def test_solver_failure_does_not_click_or_submit(self):
-        self.solver.solve.side_effect = ValueError("答案置信度不足")
+        self.solver.solve.side_effect = ValueError("模型请求失败")
         with self.assertRaises(ValueError):
             self.workflow().run()
         self.browser.apply_answers.assert_not_called()
@@ -98,7 +109,7 @@ class WorkflowTests(unittest.TestCase):
     def test_stop_during_model_request_prevents_clicks(self):
         def solve(*args):
             self.stop.set()
-            return [Answer("q", ("A",), 0.9)]
+            return [Answer("q", ("A",))]
         self.solver.solve.side_effect = solve
         with self.assertRaises(WorkflowStopped):
             self.workflow().run()

@@ -24,7 +24,7 @@ class DemoSolver:
             raise ValueError("演示答案仅适用于本次启动的本地演示页面。")
         expected = {"single": ("B",), "multiple": ("A", "B"),
                     "boolean": ("A",), "judge": ("A",)}
-        return [Answer(q.id, expected[q.kind], 1.0, "本地演示固定答案") for q in questions]
+        return [Answer(q.id, expected[q.kind], "本地演示固定答案") for q in questions]
 
 
 class Worker(threading.Thread):

@@ -21,5 +21,4 @@ class Question:
 class Answer:
     question_id: str
     choices: tuple[str, ...]
-    confidence: float
     reason: str = ""

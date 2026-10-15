@@ -70,9 +70,6 @@ class Application:
         ttk.Label(runtime, text="留空自动查找 Chromium / Edge / Chrome；会话保存在 .runtime。", style="Subtitle.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 10))
         options = ttk.Frame(runtime)
         options.grid(row=2, column=0, columnspan=3, sticky="w")
-        ttk.Label(options, text="置信度下限").pack(side="left")
-        self.fields["confidence_threshold"] = tk.StringVar(value=str(self.settings.confidence_threshold))
-        ttk.Entry(options, textvariable=self.fields["confidence_threshold"], width=7).pack(side="left", padx=(6, 18))
         ttk.Label(options, text="章节上限").pack(side="left")
         self.fields["max_chapters"] = tk.StringVar(value=str(self.settings.max_chapters))
         ttk.Entry(options, textvariable=self.fields["max_chapters"], width=7).pack(side="left", padx=(6, 18))
@@ -100,7 +97,7 @@ class Application:
         ttk.Label(container, textvariable=self.url, style="Subtitle.TLabel", wraplength=860).pack(anchor="w", pady=(4, 10))
         self.logs = scrolledtext.ScrolledText(container, height=9, state="disabled", background="#10233d", foreground="#d9e6f4", relief="flat", font=("monospace", 10), padx=12, pady=10)
         self.logs.pack(fill="both", expand=True)
-        ttk.Label(container, text="遇到未识别页面、低置信度答案或提交异常会停止，并保存诊断截图。", style="Subtitle.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(container, text="遇到未识别页面、无效答案格式或提交异常会停止，并保存诊断截图。", style="Subtitle.TLabel").pack(anchor="w", pady=(8, 0))
         if self.demo_url:
             self.test_button.configure(state="disabled")
 
@@ -121,7 +118,6 @@ class Application:
     def collect(self, require_model=False):
         values = {key: variable.get() for key, variable in self.fields.items()}
         values["max_chapters"] = int(values["max_chapters"])
-        values["confidence_threshold"] = float(values["confidence_threshold"])
         for key in ("base_url", "model", "browser_path"):
             values[key] = values[key].strip()
         settings = replace(self.settings, **values)
