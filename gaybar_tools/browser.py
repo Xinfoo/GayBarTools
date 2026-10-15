@@ -586,57 +586,215 @@ class BrowserSession:
                 self._wait(max(0.25, float(self.settings.poll_interval)))
 
     def _document_targets(self) -> list[Any]:
-        targets: list[Any] = []
+        # A reader's outer attachment/wrapper often never scrolls. Discover the
+        # actual scroll roots before accepting a flat, single-page document.
+        marker = (".ans-attach-online, #reader, #viewerContainer, #document-viewer, .document-content, "
+                  ".document-viewer, .pdfViewer, .chapter-content, [data-document], "
+                  ".ppt-container, #docContainer, #read")
+        selector = "body, body div, body main, body article, body section, " + marker
+        targets: list[tuple[int, Any]] = []
+        document_frames: set[Any] = set()
         for frame in self._frames():
             try:
-                specific = frame.locator(
-                    ".ans-attach-online, #reader, #viewerContainer, #document-viewer, .document-content, "
-                    ".document-viewer, .pdfViewer, .chapter-content, [data-document], "
-                    ".ppt-container, #docContainer, #read")
-                explicit: list[Any] = []
-                for index in range(min(specific.count(), 30)):
-                    loc = specific.nth(index)
-                    if self._visible(loc):
-                        explicit.append(loc)
-                targets.extend(explicit)
-                # Some reader versions use anonymous nested scrolling containers.
-                # Read-only geometry discovers these only inside document frames.
-                if re.search(r"read|doc|pdf|ppt|office|knowledge/cards", urlparse(frame.url).path, re.I) or explicit:
-                    candidates = frame.locator("body, body div")
-                    for index in range(min(candidates.count(), 1000)):
-                        loc = candidates.nth(index)
-                        if self._visible(loc) and loc.evaluate("""e => {
-                            const s=getComputedStyle(e), r=e.getBoundingClientRect();
-                            return r.width>200 && r.height>120 && e.scrollHeight>e.clientHeight+8
-                              && (/(auto|scroll)/.test(s.overflowY)||e===document.body);
-                        }"""):
-                            targets.append(loc)
-                    if not explicit and frame.parent_frame is not None:
-                        body = frame.locator("body")
-                        if self._visible(body) and len(_clean(body.inner_text(timeout=1000))) > 80:
-                            targets.append(body)
+                if frame.is_detached() or not self._frame_visible(frame):
+                    continue
+                explicit = frame.locator(marker)
+                has_marker = any(self._visible(explicit.nth(i))
+                                 for i in range(min(explicit.count(), 30)))
+                known_path = bool(re.search(r"read|doc|pdf|ppt|office|knowledge/cards",
+                                            urlparse(frame.url).path, re.I))
+                parent = frame.parent_frame
+                if not (has_marker or known_path or parent in document_frames):
+                    continue
+                document_frames.add(frame)
+                candidates = frame.locator(selector)
+                indices = candidates.evaluate_all(r"""(elements, marker) => {
+                    const navigation = 'aside, nav, [role=navigation], [role=tree], '
+                        + '.sidebar, .catalog, .catalogue, .directory, .toc, .outline, '
+                        + '.chapter-list, .reader-toolbar, .toolbar, .thumbnails';
+                    const rows = elements.map((e, index) => {
+                        const root = e === document.body || e === document.documentElement;
+                        const t = root ? document.scrollingElement : e;
+                        if (!t || e.closest(navigation)) return null;
+                        const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+                        if (s.visibility === 'hidden' || s.display === 'none'
+                            || (root ? innerWidth : r.width) < 180
+                            || (root ? innerHeight : r.height) < 24) return null;
+                        const client = root ? Math.min(innerHeight, t.clientHeight || innerHeight) : t.clientHeight;
+                        const scrolls = t.scrollHeight > client + 8
+                            && (root || /(auto|scroll)/.test(s.overflowY));
+                        if (!scrolls && !(e.matches(marker) || root)) return null;
+                        const media = !!e.querySelector('canvas, img, svg');
+                        const text = (e.innerText || '').replace(/\s+/g, '').length;
+                        const embedded = [...e.querySelectorAll('iframe, embed, object')].some(child => {
+                            const r=child.getBoundingClientRect(), s=getComputedStyle(child);
+                            return r.width>0 && r.height>0 && child.getClientRects().length>0
+                                && s.display!=='none' && s.visibility!=='hidden';
+                        });
+                        // Frames/plugins do not expose their reading progress on
+                        // the shell. Their own document must supply a real target.
+                        if (embedded) return null;
+                        if (!scrolls && text < 40 && !media
+                            && !(text > 0 && (e.matches(marker) || e.querySelector(marker)))) return null;
+                        return {e, t, index, scrolls};
+                    }).filter(Boolean);
+                    return rows.filter(row => !rows.some(other => other !== row
+                        && ((row.t === other.t && row.index > other.index)
+                            || (other.scrolls && other.e.contains(row.e) && !row.scrolls)
+                            || (row.e.contains(other.e) && row.t !== other.t
+                                && (other.scrolls || !row.scrolls)))))
+                        .sort((a, b) => Number(b.scrolls) - Number(a.scrolls))
+                        .map(row => row.index);
+                }""", marker)
+                depth, ancestor = 0, parent
+                while ancestor is not None:
+                    depth += 1
+                    ancestor = ancestor.parent_frame
+                targets.extend((depth, candidates.nth(index)) for index in indices)
             except Exception:
                 continue
-        return targets
+        # Inner frames contain the actual pages; outer shells should never be
+        # mistaken for proof that an embedded document has been read.
+        return [target for _depth, target in sorted(targets, key=lambda row: -row[0])]
 
     @staticmethod
     def _scroll_metrics(locator: Any) -> dict[str, float]:
         return locator.evaluate(r"""e => {
-            const t=(e===document.body||e===document.documentElement)?document.scrollingElement:e;
-            return {top:t.scrollTop, height:t.scrollHeight, client:t.clientHeight};
+            const root=e===document.body||e===document.documentElement;
+            const t=root?document.scrollingElement:e;
+            return {top:t.scrollTop, height:t.scrollHeight,
+                    client:root?Math.min(innerHeight,t.clientHeight||innerHeight):t.clientHeight};
         }""")
+
+    @staticmethod
+    def _document_local_rect(locator: Any) -> dict[str, float]:
+        # All rectangles returned here are in this element's frame viewport.
+        # Body bounding boxes become negative during window scrolling, so the
+        # scrolling document itself is represented by its viewport instead.
+        return locator.evaluate(r"""e => {
+            const root=e===document.body||e===document.documentElement;
+            const box=n => {
+                const r=n.getBoundingClientRect();
+                const sx=n.offsetWidth ? r.width/n.offsetWidth : 1;
+                const sy=n.offsetHeight ? r.height/n.offsetHeight : 1;
+                return {x:r.left+n.clientLeft*sx, y:r.top+n.clientTop*sy,
+                        width:n.clientWidth*sx, height:n.clientHeight*sy};
+            };
+            const r=root ? {x:0,y:0,width:innerWidth,height:innerHeight} : box(e);
+            let left=Math.max(0,r.x), top=Math.max(0,r.y);
+            let right=Math.min(innerWidth,r.x+r.width), bottom=Math.min(innerHeight,r.y+r.height);
+            if (!root) for(let n=e.parentElement;n;n=n.parentElement){
+                const s=getComputedStyle(n), a=box(n);
+                if(/(auto|scroll|hidden|clip)/.test(s.overflowX)){
+                    left=Math.max(left,a.x);right=Math.min(right,a.x+a.width);
+                }
+                if(/(auto|scroll|hidden|clip)/.test(s.overflowY)){
+                    top=Math.max(top,a.y);bottom=Math.min(bottom,a.y+a.height);
+                }
+            }
+            return {x:left,y:top,width:Math.max(0,right-left),height:Math.max(0,bottom-top)};
+        }""")
+
+    @staticmethod
+    def _intersect_rect(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
+        x, y = max(a["x"], b["x"]), max(a["y"], b["y"])
+        return {"x": x, "y": y,
+                "width": max(0, min(a["x"] + a["width"], b["x"] + b["width"]) - x),
+                "height": max(0, min(a["y"] + a["height"], b["y"] + b["height"]) - y)}
+
+    @staticmethod
+    def _map_document_rect(rect: dict[str, float], mapping: dict[str, float]) -> dict[str, float]:
+        return {"x": mapping["x"] + rect["x"] * mapping["sx"],
+                "y": mapping["y"] + rect["y"] * mapping["sy"],
+                "width": rect["width"] * mapping["sx"],
+                "height": rect["height"] * mapping["sy"]}
+
+    def _document_frame_geometry(self, frame: Any) -> tuple[dict[str, float], dict[str, float]]:
+        parent = frame.parent_frame
+        if parent is None:
+            viewport = frame.evaluate("() => ({x:0,y:0,width:innerWidth,height:innerHeight})")
+            return {"x": 0, "y": 0, "sx": 1, "sy": 1}, viewport
+        parent_map, clip = self._document_frame_geometry(parent)
+        element = frame.frame_element()
+        try:
+            local = self._document_local_rect(element)
+            clip = self._intersect_rect(clip, self._map_document_rect(local, parent_map))
+            # Playwright's bounding_box is already in MAIN-frame coordinates,
+            # unlike the frame-local DOM rectangles above. Keep that distinction
+            # explicit when mapping through nested or scaled iframes.
+            box = element.bounding_box()
+            size = element.evaluate("e => ({w:e.offsetWidth,h:e.offsetHeight,x:e.clientLeft,y:e.clientTop})")
+            if not box or not size["w"] or not size["h"]:
+                raise BrowserError("文档所在框架不可见。")
+            sx, sy = box["width"] / size["w"], box["height"] / size["h"]
+            return {"x": box["x"] + size["x"] * sx,
+                    "y": box["y"] + size["y"] * sy, "sx": sx, "sy": sy}, clip
+        finally:
+            element.dispose()
+
+    def _document_pointer(self, target: Any, variant: int = 0) -> tuple[float, float, dict[str, float]]:
+        handle = target.element_handle(timeout=1500)
+        if handle is None:
+            raise BrowserError("文档内容区域已消失。")
+        try:
+            frame = handle.owner_frame()
+        finally:
+            handle.dispose()
+        if frame is None:
+            raise BrowserError("无法确定文档所在框架。")
+        mapping, clip = self._document_frame_geometry(frame)
+        region = self._intersect_rect(clip, self._map_document_rect(self._document_local_rect(target), mapping))
+        if region["width"] < 24 or region["height"] < 24:
+            raise BrowserError("文档内容区域被裁剪或不可见，请调整窗口或关闭遮挡提示。")
+        positions = [(0.55, 0.55), (0.35, 0.55), (0.7, 0.7), (0.5, 0.35),
+                     (0.25, 0.75), (0.75, 0.35), (0.5, 0.8), (0.2, 0.3)]
+        for index in range(len(positions)):
+            fx, fy = positions[(index + variant) % len(positions)]
+            x, y = region["x"] + region["width"] * fx, region["y"] + region["height"] * fy
+            local = {"x": (x - mapping["x"]) / mapping["sx"],
+                     "y": (y - mapping["y"]) / mapping["sy"]}
+            hit = target.evaluate(r"""(e,p) => {
+                const h=document.elementFromPoint(p.x,p.y);
+                const t=(e===document.body||e===document.documentElement)?document.scrollingElement:e;
+                return !!h && (h===t||t.contains(h))
+                    && !h.closest('aside,nav,[role=navigation],[role=tree],.sidebar,.catalog,.catalogue,'
+                        + '.directory,.toc,.outline,.chapter-list,.toolbar,.reader-toolbar,.thumbnails,'
+                        + 'button,input,select,textarea,[role=button],iframe,embed,object');
+            }""", local)
+            if not hit:
+                continue
+            ancestor = frame
+            while ancestor.parent_frame is not None:
+                parent = ancestor.parent_frame
+                parent_map, _ = self._document_frame_geometry(parent)
+                element = ancestor.frame_element()
+                try:
+                    hit = element.evaluate("""(e,p) => {
+                        const h=document.elementFromPoint(p.x,p.y); return h===e||e.contains(h);
+                    }""", {"x": (x - parent_map["x"]) / parent_map["sx"],
+                              "y": (y - parent_map["y"]) / parent_map["sy"]})
+                finally:
+                    element.dispose()
+                if not hit:
+                    break
+                ancestor = parent
+            if hit:
+                return x, y, region
+        raise BrowserError("无法在文档内容内找到可接收鼠标滚动的位置，请关闭遮挡提示或调整阅读区域。")
 
     def read_document(self) -> None:
         self._guard()
+        self._page.bring_to_front()
         targets = self._document_targets()
         if not targets:
-            raise BrowserError("未找到受支持的文档容器，请人工查看当前页面。")
+            raise BrowserError("未找到可确认阅读进度的文档内容；嵌入阅读器或插件可能需要人工查看。")
         self.log("正在逐步滚动文档并确认阅读区域已到底部。")
         processed: set[str] = set()
-        for target in targets:
+        for number, target in enumerate(targets, start=1):
             self._guard()
             try:
                 identity = target.evaluate("""e => {
+                    if(e===document.body||e===document.documentElement)e=document.scrollingElement;
                     const a=[]; for(let n=e;n&&n.nodeType===1;n=n.parentElement){
                       a.unshift(n.tagName+':'+Array.from(n.parentElement?.children||[]).indexOf(n));
                     } return location.href+'|'+a.join('/');
@@ -646,36 +804,50 @@ class BrowserSession:
                 processed.add(identity)
                 target.scroll_into_view_if_needed(timeout=3000)
                 previous_top, stuck, bottom_reads = -1.0, 0, 0
+                bottom_since, bottom_signature, last_log = 0.0, None, 0.0
                 for _ in range(1200):
                     self._guard()
                     metrics = self._scroll_metrics(target)
+                    if metrics["client"] < 1 or metrics["height"] < 1:
+                        raise BrowserError("文档阅读区域尺寸无效，无法确认阅读进度。")
                     if metrics["top"] + metrics["client"] >= metrics["height"] - 3:
+                        # Also confirm a visible, unobstructed content area for
+                        # single-page readers. A flat shell is not completion.
+                        self._document_pointer(target, stuck)
+                        signature = (metrics["height"], metrics["client"])
+                        if signature != bottom_signature:
+                            bottom_signature, bottom_since, bottom_reads = signature, time.monotonic(), 0
                         bottom_reads += 1
-                        if bottom_reads >= 3:
+                        settle = max(1.2, 2 * max(0.4, float(self.settings.poll_interval)))
+                        if bottom_reads >= 3 and time.monotonic() - bottom_since >= settle:
                             break
                         self._wait(max(0.4, float(self.settings.poll_interval)))
                         continue
-                    bottom_reads = 0
+                    bottom_reads, bottom_since, bottom_signature = 0, 0.0, None
                     if abs(metrics["top"] - previous_top) < 1:
                         stuck += 1
                         if stuck >= 6:
-                            raise BrowserError("文档滚动没有进展，请检查遮挡提示或嵌套阅读器。")
+                            raise BrowserError("文档滚动没有进展，已尝试重新定位内容区域；请检查遮挡提示或嵌套阅读器。")
                     else:
                         stuck = 0
                     previous_top = metrics["top"]
-                    box = target.bounding_box(timeout=1500)
-                    if not box:
-                        raise BrowserError("文档容器不可见。")
-                    viewport = self._page.viewport_size or {"width": 1440, "height": 960}
-                    x = min(viewport["width"] - 20, max(20, box["x"] + box["width"] * 0.55))
-                    y = min(viewport["height"] - 30, max(30, box["y"] + min(box["height"], 600) * 0.55))
+                    x, y, region = self._document_pointer(target, stuck)
+                    if not last_log or stuck or time.monotonic() - last_log > 20:
+                        self.log(f"文档 {number}/{len(targets)}：可见内容 {region['width']:.0f}×{region['height']:.0f}，"
+                                 f"进度 {metrics['top']:.0f}+{metrics['client']:.0f}/{metrics['height']:.0f}，"
+                                 f"鼠标位置 ({x:.0f}, {y:.0f})。")
+                        last_log = time.monotonic()
                     self._move_mouse(x, y)
-                    self._page.mouse.wheel(0, random.uniform(280, 540))
-                    self._wait(random.uniform(0.45, 0.95))
+                    self._page.mouse.wheel(0, random.uniform(650, 1000))
+                    # wheel dispatch returns before the browser finishes scrolling.
+                    self._wait(random.uniform(0.18, 0.32))
                 else:
                     raise BrowserError("文档页过长或一直加载新内容，已停止自动滚动。")
+                metrics = self._scroll_metrics(target)
                 if metrics["top"] + metrics["client"] < metrics["height"] - 3:
                     raise BrowserError("尚未确认文档已滚动到底部。")
+                self.log(f"文档 {number}/{len(targets)} 已确认到底部："
+                         f"{metrics['top']:.0f}+{metrics['client']:.0f}/{metrics['height']:.0f}。")
             except (BrowserError, StopRequested):
                 raise
             except Exception as exc:
