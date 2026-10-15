@@ -47,7 +47,7 @@ class StartButtonTests(unittest.TestCase):
                 "max_chapters", "auto_submit",
             )
         }
-        for name in ("launch", "start", "stop", "test", "save"):
+        for name in ("launch", "start", "stop", "test", "save", "save_login"):
             setattr(self.app, name + "_button", Mock())
 
     def test_start_is_enabled_before_a_chapter_is_detected(self):
@@ -104,6 +104,23 @@ class StartButtonTests(unittest.TestCase):
                 self.assertFalse(self.app.busy)
                 for name, value in originals.items():
                     self.app.fields[name].set(value)
+
+    def test_save_login_does_not_require_api_configuration(self):
+        self.app.fields["model"].set("")
+        self.app.fields["base_url"].set("unfinished API address")
+        with patch("gaybar_tools.ui.messagebox.showerror") as showerror:
+            self.app.send("save_login")
+        showerror.assert_not_called()
+        self.assertEqual(self.app.worker.command.call_args.args[0], "save_login")
+        self.app.save_login_button.configure.assert_called_with(state="disabled")
+
+    def test_save_login_is_blocked_while_busy_or_closing(self):
+        for busy, closing in ((True, False), (False, True)):
+            self.app.busy, self.app.closing = busy, closing
+            self.app.update_buttons()
+            self.app.save_login_button.configure.assert_called_with(state="disabled")
+            self.app.send("save_login")
+            self.app.worker.command.assert_not_called()
 
 
 if __name__ == "__main__":

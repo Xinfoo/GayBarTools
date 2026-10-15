@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, urlparse
 
 from .config import AppSettings
+from .cookies import CookieStore, CookieStoreError
 from .isolation import IsolationError, prepare_browser_executable
 from .models import Answer, Option, Question
 from .paths import AppPaths
@@ -70,6 +71,12 @@ class BrowserSession:
         self._page_order: list[Any] = []
         self._attached_pages: set[Any] = set()
         self._session_tmp: tempfile.TemporaryDirectory[str] | None = None
+        self._cookie_store = CookieStore(paths)
+        self._cookie_state_ready = False
+        self._last_cookie_save = 0.0
+        self._cookie_save_failed = False
+        self._cookie_saved_logged = False
+        self._cookie_restore_failed = False
 
     @property
     def current_url(self) -> str:
@@ -91,6 +98,7 @@ class BrowserSession:
         until = time.monotonic() + max(0, seconds)
         while time.monotonic() < until:
             self._check_stop()
+            self._checkpoint_cookies()
             remaining = min(0.15, until - time.monotonic())
             if remaining <= 0:
                 break
@@ -99,6 +107,76 @@ class BrowserSession:
             else:
                 self.stop_event.wait(remaining)
         self._check_stop()
+        self._checkpoint_cookies()
+
+    def _restore_login_state(self) -> None:
+        try:
+            cookies = self._cookie_store.load()
+            if cookies is not None:
+                # The snapshot represents the latest saved jar, including a
+                # deliberate empty jar after logout. Do not revive stale
+                # profile cookies that are absent from that snapshot.
+                original = None
+                try:
+                    original = self._context.cookies()
+                    self._context.clear_cookies()
+                    if cookies:
+                        self._context.add_cookies(cookies)
+                    self.log("已恢复项目内保存的浏览器登录状态；过期登录仍需手动更新。")
+                except Exception:
+                    # A browser/API mismatch must not destroy either the
+                    # native jar or the last valid on-disk snapshot.
+                    self._cookie_restore_failed = True
+                    if original is not None:
+                        try:
+                            self._context.clear_cookies()
+                            if original:
+                                self._context.add_cookies(original)
+                        except Exception:
+                            pass
+                    self.log("无法恢复本地登录状态，原文件已保留；请手动登录后点击立即保存登录状态。")
+        except CookieStoreError as exc:
+            self.log(str(exc))
+        except Exception:
+            # Browser API errors can contain Cookie data in their arguments.
+            self.log("无法恢复本地登录状态，请在浏览器中手动登录。")
+        self._cookie_state_ready = True
+        self._last_cookie_save = time.monotonic()
+
+    def _checkpoint_cookies(self, *, force: bool = False, report: bool = False) -> None:
+        if self._context is None or not self._cookie_state_ready:
+            return
+        # Anonymous/analytics cookies can change on a login page as well, so
+        # only an explicit Save may replace a snapshot after a failed restore.
+        if self._cookie_restore_failed and not report:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_cookie_save < 5:
+            return
+        self._last_cookie_save = now
+        try:
+            cookies = self._context.cookies()
+            self._cookie_store.save(cookies)
+            self._cookie_restore_failed = False
+            self._cookie_save_failed = False
+            if report or not self._cookie_saved_logged:
+                self.log("浏览器登录状态已保存到项目目录。")
+                self._cookie_saved_logged = True
+        except Exception:
+            message = "无法保存浏览器登录状态；请确认浏览器仍在运行，且项目目录可写。"
+            if report:
+                raise BrowserError(message) from None
+            if not self._cookie_save_failed:
+                self.log(message)
+                self._cookie_save_failed = True
+
+    def save_login_state(self) -> None:
+        """Save the current jar now, from its owner thread, even after Stop."""
+        if self._owner_thread is not None and self._owner_thread != threading.get_ident():
+            raise BrowserError("浏览器必须由启动它的同一个工作线程操作。")
+        if self._context is None or not self._cookie_state_ready:
+            raise BrowserError("请先打开浏览器，并在登录后保存登录状态。")
+        self._checkpoint_cookies(force=True, report=True)
 
     def _delay(self) -> None:
         low = max(0, float(self.settings.action_delay_min))
@@ -213,6 +291,7 @@ class BrowserSession:
                     user_data_dir=str(self.paths.profile), **options)
             self._context.set_default_timeout(5000)
             self._context.set_default_navigation_timeout(20000)
+            self._restore_login_state()
             self._context.on("page", self._attach_page)
             pages = self._context.pages
             self._page = pages[0] if pages else self._context.new_page()
@@ -378,6 +457,7 @@ class BrowserSession:
                 if not pump.is_closed():
                     raise
         pages = [page for page in self._context.pages if not page.is_closed()]
+        self._checkpoint_cookies()
         for page in pages:
             self._attach_page(page)
         if self._chapter_page_selected and self._page in self._page_order:
@@ -1115,9 +1195,17 @@ class BrowserSession:
     def close(self) -> None:
         if self._owner_thread is not None and self._owner_thread != threading.get_ident():
             raise BrowserError("请在浏览器工作线程中关闭浏览器。")
+        # Stop only cancels course actions. The last checkpoint must still run
+        # before Chromium closes, while its session cookies remain readable.
+        self._checkpoint_cookies(force=True)
         context, playwright = self._context, self._playwright
         temporary, self._session_tmp = self._session_tmp, None
         self._context = self._playwright = self._page = None
+        self._cookie_state_ready = False
+        self._last_cookie_save = 0.0
+        self._cookie_save_failed = False
+        self._cookie_saved_logged = False
+        self._cookie_restore_failed = False
         self._chapter_page_selected = False
         self._page_order.clear()
         self._attached_pages.clear()

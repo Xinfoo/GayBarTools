@@ -58,6 +58,22 @@ class WorkerCancellationTests(unittest.TestCase):
         states = [value for kind, value in self.events.queue if kind == "state"]
         self.assertTrue(any("请先打开浏览器" in value for value in states))
 
+    def test_save_login_uses_browser_worker_without_starting_course(self):
+        self.worker.browser = Mock()
+        self.worker.command("save_login", self.settings)
+        with patch("gaybar_tools.worker.Workflow") as workflow:
+            self.finish_after_pending_command()
+        self.worker.browser.save_login_state.assert_called_once()
+        workflow.assert_not_called()
+        states = [value for kind, value in self.events.queue if kind == "state"]
+        self.assertTrue(any("登录状态已保存" in value for value in states))
+
+    def test_save_login_without_browser_reports_manual_login_step(self):
+        self.worker.command("save_login", self.settings)
+        self.finish_after_pending_command()
+        states = [value for kind, value in self.events.queue if kind == "state"]
+        self.assertTrue(any("请先打开浏览器并登录" in value for value in states))
+
     def test_shutdown_before_dequeue_discards_pending_launch(self):
         self.worker.browser = Mock()
         self.worker.command("launch", self.settings)

@@ -78,6 +78,12 @@ class Application:
         ttk.Entry(options, textvariable=self.fields["max_chapters"], width=7).pack(side="left", padx=(6, 18))
         self.check(options, "自动提交并继续下一节", "auto_submit").pack(side="left")
 
+        login = ttk.Frame(runtime)
+        login.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(login, text="登录状态自动保存在项目中，下次打开浏览器时恢复。", style="Subtitle.TLabel").pack(side="left")
+        self.save_login_button = ttk.Button(login, text="立即保存登录状态", command=lambda: self.send("save_login"))
+        self.save_login_button.pack(side="right")
+
         actions = ttk.Frame(container)
         actions.pack(fill="x", pady=16)
         self.launch_button = ttk.Button(actions, text="1  打开浏览器", command=lambda: self.send("launch"))
@@ -136,14 +142,17 @@ class Application:
         if self.busy or self.closing:
             return
         try:
-            self.settings = self.collect(require_model=name in {"start", "test"})
-            self.settings.save(self.paths.runtime / "settings.json")
+            # Saving the browser session also works before configuring an API.
+            if name != "save_login":
+                self.settings = self.collect(require_model=name in {"start", "test"})
+                self.settings.save(self.paths.runtime / "settings.json")
         except (ValueError, OSError) as exc:
             messagebox.showerror("设置无效", str(exc), parent=self.root)
             return
         self.busy = True
         self.update_buttons()
-        self.state.set({"launch": "正在打开浏览器…", "start": "开始处理课程章节…", "test": "正在测试 API…"}[name])
+        self.state.set({"launch": "正在打开浏览器…", "start": "开始处理课程章节…",
+                        "test": "正在测试 API…", "save_login": "正在保存登录状态…"}[name])
         self.worker.command(name, replace(self.settings))
 
     def stop(self):
@@ -159,6 +168,7 @@ class Application:
         self.stop_button.configure(state="normal" if self.busy and not self.closing else "disabled")
         self.test_button.configure(state="disabled" if self.busy or self.demo_url or self.closing else "normal")
         self.save_button.configure(state="disabled" if self.closing else "normal")
+        self.save_login_button.configure(state="disabled" if self.busy or self.closing else "normal")
 
     def drain(self):
         while True:

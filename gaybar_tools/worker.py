@@ -121,6 +121,11 @@ class Worker(threading.Thread):
                         self.emit("state", "正在测试 API")
                         self.log(QuizSolver(settings, self.log, self.stop_event).test_connection())
                         self.emit("state", "API 连接成功")
+                    elif name == "save_login":
+                        if not self.browser:
+                            raise ValueError("请先打开浏览器并登录，再保存登录状态。")
+                        self.browser.save_login_state()
+                        self.emit("state", "登录状态已保存，下次打开浏览器时将自动恢复。")
                     elif name == "start":
                         if not self.browser:
                             raise ValueError("请先打开浏览器。")
@@ -137,7 +142,7 @@ class Worker(threading.Thread):
                         message = message.replace(settings.api_key, "[已隐藏]")
                     self.log("处理停止：" + message)
                     self.emit("state", "需要处理：" + message)
-                    if self.browser and name != "test" and not self.stop_event.is_set():
+                    if self.browser and name not in {"test", "save_login"} and not self.stop_event.is_set():
                         try:
                             path = self.browser.capture_diagnostic()
                             if path:
