@@ -97,7 +97,7 @@ class Application:
         ttk.Label(container, textvariable=self.url, style="Subtitle.TLabel", wraplength=860).pack(anchor="w", pady=(4, 10))
         self.logs = scrolledtext.ScrolledText(container, height=9, state="disabled", background="#10233d", foreground="#d9e6f4", relief="flat", font=("monospace", 10), padx=12, pady=10)
         self.logs.pack(fill="both", expand=True)
-        ttk.Label(container, text="遇到未识别页面、无效答案格式或提交异常会停止，并保存诊断截图。", style="Subtitle.TLabel").pack(anchor="w", pady=(8, 0))
+        ttk.Label(container, text="遇到未识别页面、答案格式重试耗尽或提交异常会停止，并保存诊断截图。", style="Subtitle.TLabel").pack(anchor="w", pady=(8, 0))
         if self.demo_url:
             self.test_button.configure(state="disabled")
 

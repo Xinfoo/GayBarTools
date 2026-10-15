@@ -118,6 +118,39 @@ class BrowserIntegrationTests(unittest.TestCase):
         self.assertTrue(metrics["submitTrusted"])
         self.assertTrue(metrics["confirmTrusted"])
 
+    def completion_api(self, content_for_request):
+        """Use a real local endpoint without an account or paid model."""
+        requests = []
+
+        class SyntheticAPI(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(payload)
+                content = content_for_request(payload, len(requests))
+                body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        api = ThreadingHTTPServer(("127.0.0.1", 0), SyntheticAPI)
+        api_thread = threading.Thread(target=api.serve_forever, daemon=True)
+        api_thread.start()
+
+        def close_api():
+            api.shutdown()
+            api.server_close()
+            api_thread.join(timeout=3)
+
+        self.addCleanup(close_api)
+        self.settings.base_url = f"http://127.0.0.1:{api.server_port}/v1"
+        self.settings.model = "local-synthetic-model"
+        return requests
+
     def test_two_chapters_use_native_video_inner_scroll_and_confirmed_submission(self):
         self.launch("home.html")
         self.assertFalse(self.browser.poll_ready(), "主页不应被识别为课程章节")
@@ -235,6 +268,82 @@ class BrowserIntegrationTests(unittest.TestCase):
             api.shutdown()
             api.server_close()
             api_thread.join(timeout=3)
+
+    def test_format_retries_resume_submission_and_navigation_after_valid_answers(self):
+        from gaybar_tools.llm import QuizSolver
+        from gaybar_tools.workflow import Workflow
+
+        def content_for_request(payload, attempt):
+            questions = json.loads(payload["messages"][1]["content"][0]["text"].split("\n", 1)[1])
+            choices = {"single": ["B"], "multiple": ["A", "B"], "boolean": ["A"]}
+            answers = [
+                {"question_id": question["question_id"], "choices": choices[question["kind"]]}
+                for question in questions
+            ]
+            if attempt == 1:
+                return "This is not JSON."
+            if attempt == 2:
+                answers = []
+            elif attempt == 3:
+                answers[0]["choices"] = ["Z"]
+            elif attempt == 5:
+                answers.pop()
+            return json.dumps({"answers": answers}, ensure_ascii=False)
+
+        requests = self.completion_api(content_for_request)
+        observations = []
+        browser_test = self
+
+        class ObservedSolver(QuizSolver):
+            def _completion(self, messages):
+                content = super()._completion(messages)
+                observations.append(browser_test.metrics())
+                return content
+
+        self.settings.vision = True
+        self.launch()
+        self.wait_ready()
+        solver = ObservedSolver(self.settings, self.logs.append, self.stop)
+        with patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
+            completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
+
+        self.assertEqual(completed, 2)
+        self.assertEqual(len(requests), 6, "首章可在第三次重试成功；下一章应重新计算重试次数")
+        for start, end in ((0, 4), (4, 6)):
+            original = requests[start]["messages"][:2]
+            for request_payload in requests[start:end]:
+                self.assertEqual(request_payload["messages"][:2], original, "重试必须保留同一批原题和截图")
+        for index, observation in enumerate(observations):
+            chapter = "1" if index < 4 else "2"
+            quiz = observation.get(chapter, {}).get("quiz", {})
+            for event in ("inputClicks", "submitClicks", "confirmClicks"):
+                self.assertEqual(quiz.get(event, 0), 0, "格式通过前不能填写或提交当前章")
+        self.assertEqual(self.browser.page.url, f"{self.base_url}/complete.html")
+        for chapter in ("1", "2"):
+            self.assert_quiz_events(self.metrics()[chapter]["quiz"])
+            self.assertTrue(self.metrics()[chapter]["navigation"]["nextTrusted"])
+
+    def test_exhausted_format_retries_leave_quiz_without_clicking_answers(self):
+        from gaybar_tools.llm import QuizSolver, SolverError
+        from gaybar_tools.workflow import Workflow
+
+        requests = self.completion_api(lambda _payload, _attempt: '{"answers": []}')
+        self.settings.vision = True
+        self.launch("quiz.html?chapterId=1&courseId=demo")
+        self.wait_ready()
+        current_url = self.browser.page.url
+        solver = QuizSolver(self.settings, self.logs.append, self.stop)
+        with patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
+            with self.assertRaises(SolverError) as failure:
+                Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
+
+        self.assertEqual(len(requests), 4, f"首次失败后最多再重试三次：{failure.exception}")
+        self.assertEqual(self.browser.page.url, current_url)
+        self.assertEqual(self.browser.page.locator("input:checked").count(), 0)
+        quiz = self.metrics().get("1", {}).get("quiz", {})
+        for event in ("inputClicks", "submitClicks", "confirmClicks"):
+            self.assertEqual(quiz.get(event, 0), 0)
+        self.assertFalse(quiz.get("submitted", False))
 
     def test_stop_during_video_preserves_page_without_answering(self):
         self.launch()

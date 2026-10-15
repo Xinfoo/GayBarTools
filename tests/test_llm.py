@@ -1,4 +1,4 @@
-"""No paid calls: exercise provider requests and fail-closed answer handling."""
+"""No paid calls: exercise provider requests, validation, and bounded retries."""
 
 import base64
 import io
@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from gaybar_tools.config import AppSettings
-from gaybar_tools.llm import QuizSolver, SolverCancelled, SolverError, _SameOriginRedirectHandler, _completion_url
+from gaybar_tools.llm import AnswerFormatError, QuizSolver, SolverCancelled, SolverError, _SameOriginRedirectHandler, _completion_url
 from gaybar_tools.models import Option, Question
 
 
@@ -38,17 +38,18 @@ class QuizSolverTests(unittest.TestCase):
         self.solver = QuizSolver(self.settings, self.messages.append, self.stop)
 
     def solve_with(self, answers, questions=None, screenshot=None):
-        with patch("gaybar_tools.llm.request.OpenerDirector.open", return_value=api_response(json.dumps({"answers": answers}))) as mocked:
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(json.dumps({"answers": answers}))) as mocked:
             result = self.solver.solve(questions or [make_question()], screenshot)
             return result, mocked
 
     def test_single_multiple_and_boolean_are_returned_in_question_order(self):
         questions = [make_question("single"), make_question("multi", "multiple"), make_question("judge", "boolean")]
-        result, _ = self.solve_with(
+        result, mocked = self.solve_with(
             [answer("judge", ["B"]), answer("multi", ["B", "A"]), answer("single")], questions
         )
         self.assertEqual([item.question_id for item in result], ["single", "multi", "judge"])
         self.assertEqual(result[1].choices, ("B", "A"))
+        mocked.assert_called_once()
 
     def test_judge_alias_and_single_correct_multiple_option(self):
         self.solve_with([answer()], [make_question(kind="judge")])
@@ -116,13 +117,117 @@ class QuizSolverTests(unittest.TestCase):
             (json.dumps({"answers": [{**answer(), "reason": []}]}), "解释格式"),
         ]
         for content, expected in invalid:
-            with self.subTest(content=content), patch("gaybar_tools.llm.request.OpenerDirector.open", return_value=api_response(content)):
+            with self.subTest(content=content), patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(content)) as mocked:
                 with self.assertRaisesRegex(SolverError, expected):
                     self.solver.solve([make_question()])
+                self.assertEqual(mocked.call_count, 4)
 
     def test_missing_question_rejected(self):
         with self.assertRaisesRegex(SolverError, "遗漏"):
             self.solve_with([answer()], [make_question(), make_question("q2")])
+
+    def test_format_retry_can_recover_on_second_or_last_allowed_request(self):
+        for failures in (1, 3):
+            with self.subTest(failures=failures):
+                responses = [api_response("not json") for _ in range(failures)]
+                responses.append(api_response(json.dumps({"answers": [answer()]})))
+                with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses) as mocked:
+                    result = self.solver.solve([make_question()])
+                self.assertEqual(result[0].choices, ("A",))
+                self.assertEqual(mocked.call_count, failures + 1)
+
+    def test_retry_preserves_all_question_evidence_without_repeating_ocr_or_raw_output(self):
+        self.settings.ocr = True
+        questions = [make_question(), make_question("q2", "multiple")]
+        private_output = "PRIVATE_RAW_MODEL_OUTPUT_INVALID_JSON"
+        responses = [api_response(private_output), api_response(json.dumps({"answers": [answer(), answer("q2", ["A", "B"])]}))]
+        with patch.object(self.solver, "_ocr_screenshot", return_value="OCR evidence") as ocr, patch(
+            "gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses
+        ) as mocked:
+            result = self.solver.solve(questions, PNG)
+        self.assertEqual(len(result), 2)
+        ocr.assert_called_once_with(PNG)
+        self.assertEqual(mocked.call_count, 2)
+        payloads = [json.loads(call.args[0].data) for call in mocked.call_args_list]
+        first_source = payloads[0]["messages"][1]
+        source_text = first_source["content"][0]["text"]
+        image_url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+        request_texts = []
+        for payload in payloads:
+            text_parts = []
+            images = []
+            for message in payload["messages"]:
+                content = message["content"]
+                if isinstance(content, str):
+                    text_parts.append(content)
+                else:
+                    text_parts.extend(part["text"] for part in content if part["type"] == "text")
+                    images.extend(part["image_url"]["url"] for part in content if part["type"] == "image_url")
+            request_text = "\n".join(text_parts)
+            request_texts.append(request_text)
+            self.assertIn(source_text, request_text)
+            self.assertEqual(images, [image_url])
+            self.assertNotIn(private_output, json.dumps(payload, ensure_ascii=False))
+        self.assertIn("q1", source_text)
+        self.assertIn("q2", source_text)
+        self.assertIn("OCR evidence", source_text)
+        feedback = request_texts[1].replace(payloads[0]["messages"][0]["content"], "").replace(source_text, "")
+        self.assertIn("JSON", feedback)
+        self.assertNotIn(private_output, "\n".join(self.messages))
+
+    def test_exhausted_retries_do_not_return_a_partially_valid_batch(self):
+        incomplete = json.dumps({"answers": [answer()]})
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(incomplete)) as mocked:
+            with self.assertRaisesRegex(SolverError, "遗漏"):
+                self.solver.solve([make_question(), make_question("q2")])
+        self.assertEqual(mocked.call_count, 4)
+
+    def test_truncated_or_empty_model_answers_can_be_retried(self):
+        for invalid in (lambda: api_response("{}", finish_reason="length"), lambda: api_response("")):
+            with self.subTest(invalid=invalid):
+                responses = [invalid(), api_response(json.dumps({"answers": [answer()]}))]
+                with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses) as mocked:
+                    result = self.solver.solve([make_question()])
+                self.assertEqual(result[0].choices, ("A",))
+                self.assertEqual(mocked.call_count, 2)
+
+    def test_cancel_after_invalid_answer_prevents_another_request(self):
+        parse_answers = self.solver._parse_answers
+
+        def reject_and_cancel(*args, **kwargs):
+            try:
+                return parse_answers(*args, **kwargs)
+            finally:
+                self.stop.set()
+
+        with patch.object(self.solver, "_parse_answers", side_effect=reject_and_cancel), patch(
+            "gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response("not json")
+        ) as mocked:
+            with self.assertRaises(SolverCancelled):
+                self.solver.solve([make_question()])
+        mocked.assert_called_once()
+
+    def test_transport_provider_and_refusal_errors_are_not_retried(self):
+        failures = [
+            lambda: URLError("private network details"),
+            lambda: socket.timeout("private network details"),
+            lambda: HTTPError("http://localhost", 401, "private authentication details", {}, io.BytesIO(b"private")),
+            lambda: io.BytesIO(b"invalid provider envelope"),
+            lambda: io.BytesIO(json.dumps({"choices": [{"message": {"content": "", "refusal": "private refusal details"}}]}).encode()),
+        ]
+        for failure in failures:
+            def response(*args, **kwargs):
+                value = failure()
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+
+            with self.subTest(failure=failure), patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=response) as mocked:
+                with self.assertRaises(SolverError) as caught:
+                    self.solver.solve([make_question()])
+                self.assertNotIsInstance(caught.exception, AnswerFormatError)
+                self.assertNotIn("private", str(caught.exception))
+                mocked.assert_called_once()
 
     def test_answers_need_no_confidence_and_prompt_does_not_request_it(self):
         result, mocked = self.solve_with([answer()])

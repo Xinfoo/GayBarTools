@@ -23,6 +23,10 @@ class SolverError(RuntimeError):
     """A question cannot safely be answered using the configured provider."""
 
 
+class AnswerFormatError(SolverError):
+    """The model's answer cannot be mapped to the supplied questions."""
+
+
 class SolverCancelled(SolverError):
     """The user requested that the current operation stop."""
 
@@ -76,11 +80,13 @@ class QuizSolver:
     """Send the extracted DOM and optional screenshot to an explicit endpoint.
 
     The caller must validate the returned choices against the page again before
-    clicking. An HTTP request already in flight can take up to request_timeout to
-    observe cancellation; it is never retried automatically.
+    clicking. Answer format failures resend the original questions up to three
+    times. Transport errors are not retried. An HTTP request already in flight
+    can take up to request_timeout to observe cancellation.
     """
 
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+    MAX_FORMAT_RETRIES = 3
 
     def __init__(
         self,
@@ -163,7 +169,7 @@ class QuizSolver:
                 raise ValueError
             choice = choices[0]
             if choice.get("finish_reason") == "length":
-                raise SolverError("模型输出被截断，请减少一次处理的题目数或调整服务输出限制。")
+                raise AnswerFormatError("模型输出被截断，答案不完整。")
             message = choice["message"]
             if not isinstance(message, dict):
                 raise ValueError
@@ -178,8 +184,10 @@ class QuizSolver:
                     and part.get("type") in {"text", "output_text"}
                     and isinstance(part.get("text"), str)
                 )
-            if not isinstance(content, str) or not content.strip():
+            if not isinstance(content, str):
                 raise ValueError
+            if not content.strip():
+                raise AnswerFormatError("模型返回了空答案。")
             return content.strip()
         except (KeyError, ValueError, TypeError, UnicodeError):
             raise SolverError("API 没有返回有效的 Chat Completions 消息。") from None
@@ -312,11 +320,36 @@ class QuizSolver:
             {"role": "user", "content": user_content},
         ]
         self.log(f"正在请求模型识别并回答 {len(questions)} 道题。")
-        response = self._completion(messages)
-        answers = self._parse_answers(response, indexed)
-        self._check_cancelled()
-        self.log(f"模型返回的 {len(answers)} 道题已通过格式和选项检查。")
-        return answers
+        attempt_messages = messages
+        for attempt in range(self.MAX_FORMAT_RETRIES + 1):
+            self._check_cancelled()
+            try:
+                response = self._completion(attempt_messages)
+                answers = self._parse_answers(response, indexed)
+            except AnswerFormatError as exc:
+                self._check_cancelled()
+                if attempt == self.MAX_FORMAT_RETRIES:
+                    raise AnswerFormatError(
+                        f"模型答案已重试 {self.MAX_FORMAT_RETRIES} 次（共 {attempt + 1} 次请求）仍未通过"
+                        f"格式和选项检查，已停止作答。最后原因：{exc}"
+                    ) from None
+                self.log(f"模型答案未通过格式和选项检查：{exc} "
+                         f"正在重试（{attempt + 1}/{self.MAX_FORMAT_RETRIES}）。")
+                # Send the same evidence again with one bounded correction
+                # hint. Never echo the untrusted model output into logs or
+                # subsequent requests, and do not accumulate retry history.
+                attempt_messages = messages + [{
+                    "role": "user",
+                    "content": (
+                        f"上一条回答未通过格式和选项检查：{exc} "
+                        "请根据上方原题目、选项和提供的图片或 OCR 重新回答全部题目。"
+                        "仅输出要求的 JSON，每道题恰好回答一次，choices 使用对应题目的有效选项标签。"
+                    ),
+                }]
+                continue
+            self._check_cancelled()
+            self.log(f"模型返回的 {len(answers)} 道题已通过格式和选项检查。")
+            return answers
 
     def _parse_answers(self, content: str, questions: dict[str, Question]) -> list[Answer]:
         fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content.strip(), flags=re.DOTALL | re.IGNORECASE)
@@ -324,33 +357,33 @@ class QuizSolver:
             content = fence.group(1)
         try:
             decoded = json.loads(content)
-        except (ValueError, TypeError):
-            raise SolverError("模型没有返回有效 JSON，已停止作答。") from None
+        except (ValueError, TypeError, RecursionError):
+            raise AnswerFormatError("模型没有返回有效 JSON。") from None
         raw_answers = decoded.get("answers") if isinstance(decoded, dict) else decoded
         if not isinstance(raw_answers, list) or not raw_answers:
-            raise SolverError("模型没有返回有效答案列表，已停止作答。")
+            raise AnswerFormatError("模型没有返回有效答案列表。")
         validated: dict[str, Answer] = {}
         for item in raw_answers:
             if not isinstance(item, dict):
-                raise SolverError("模型答案格式无效，已停止作答。")
+                raise AnswerFormatError("模型答案格式无效。")
             question_id = item.get("question_id")
             if not isinstance(question_id, str) or question_id not in questions:
-                raise SolverError("模型返回了未知题目，已停止作答。")
+                raise AnswerFormatError("模型返回了未知题目。")
             if question_id in validated:
-                raise SolverError("模型重复回答同一道题，已停止作答。")
+                raise AnswerFormatError("模型重复回答同一道题。")
             question = questions[question_id]
             choices = item.get("choices")
             allowed = {option.label for option in question.options}
             if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) or choice not in allowed for choice in choices):
-                raise SolverError("模型返回了空答案或未知选项，已停止作答。")
+                raise AnswerFormatError("模型返回了空答案或未知选项。")
             if len(set(choices)) != len(choices):
-                raise SolverError("模型返回了重复选项，已停止作答。")
+                raise AnswerFormatError("模型返回了重复选项。")
             if question.kind in {"single", "boolean", "judge"} and len(choices) != 1:
-                raise SolverError("单选题或判断题只能选择一个选项，已停止作答。")
+                raise AnswerFormatError("单选题或判断题只能选择一个选项。")
             reason = item.get("reason", "")
             if not isinstance(reason, str):
-                raise SolverError("模型答案解释格式无效，已停止作答。")
+                raise AnswerFormatError("模型答案解释格式无效。")
             validated[question_id] = Answer(question_id, tuple(choices), reason)
         if set(validated) != set(questions):
-            raise SolverError("模型遗漏了题目，已停止作答。")
+            raise AnswerFormatError("模型遗漏了题目。")
         return [validated[question_id] for question_id in questions]
