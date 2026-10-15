@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,11 +15,68 @@ from unittest.mock import Mock, patch
 
 from gaybar_tools.browser import BrowserSession
 from gaybar_tools.config import AppSettings
-from gaybar_tools.isolation import IsolationError, bubblewrap_command, prepare_browser_executable
+from gaybar_tools.isolation import (IsolationError, _gpu_device_nodes, bubblewrap_command,
+                                    prepare_browser_executable)
 from gaybar_tools.paths import AppPaths
 
 
 PROJECT = Path(__file__).resolve().parents[1]
+
+
+class GpuDeviceDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="gbt-gpu-inventory-", dir="/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.devices = self.base / "dev"
+        self.devices.mkdir()
+        self.character_nodes = set()
+        original_lstat = Path.lstat
+
+        def simulated_lstat(path, *args, **kwargs):
+            result = original_lstat(path, *args, **kwargs)
+            if path in self.character_nodes and not stat.S_ISLNK(result.st_mode):
+                return SimpleNamespace(st_mode=stat.S_IFCHR | 0o600)
+            return result
+
+        # Unprivileged tests cannot mknod; only the character-device metadata
+        # is simulated. Names, directory traversal, files and symlinks are real.
+        self.lstat_patch = patch.object(Path, "lstat", simulated_lstat)
+        self.lstat_patch.start()
+        self.addCleanup(self.lstat_patch.stop)
+
+    def node(self, name, *, character=True):
+        path = self.devices / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        if character:
+            self.character_nodes.add(path)
+        return path
+
+    def test_only_known_gpu_character_devices_are_selected(self):
+        expected = [self.node(name) for name in (
+            "dri/card0", "dri/card12", "dri/renderD128", "nvidia0", "nvidia10",
+            "nvidiactl", "nvidia-modeset", "nvidia-uvm", "nvidia-uvm-tools",
+            "nvidia-caps/nvidia-cap1")]
+        for name in ("dri/card0extra", "dri/controlD64", "nvidia0extra", "nvidia-log",
+                     "nvidia-caps/other", "sda", "input/event0"):
+            self.node(name)
+        self.node("dri/renderD129", character=False)
+        self.node("nvidia1", character=False)
+        (self.devices / "dri/card3").mkdir()
+        target = self.node("unrelated-device")
+        (self.devices / "nvidia2").symlink_to(target)
+        (self.devices / "dri/card4").symlink_to(self.base / "missing")
+        self.assertEqual(_gpu_device_nodes(self.devices), sorted(expected))
+
+    def test_symlinked_device_directory_cannot_escape_inventory(self):
+        external = self.base / "outside-dev"
+        external.mkdir()
+        (external / "card0").touch()
+        (self.devices / "dri").symlink_to(external, target_is_directory=True)
+        self.character_nodes.add(self.devices / "dri/card0")
+        self.assertEqual(_gpu_device_nodes(self.devices), [])
+        self.assertEqual(_gpu_device_nodes(self.base / "nonexistent"), [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("bwrap"), "需要 Linux 和 bubblewrap")
@@ -38,7 +96,7 @@ class LinuxIsolationTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=12,
                               env=self.paths.environment(), cwd=self.root)
 
-    def test_quoted_launcher_keeps_home_arguments_and_only_two_writable_binds(self):
+    def test_quoted_launcher_keeps_home_arguments_and_only_two_writable_filesystem_binds(self):
         command = bubblewrap_command(sys.executable, self.paths)
         writable = [(command[index + 1], command[index + 2])
                     for index, argument in enumerate(command) if argument == "--bind"]
@@ -52,6 +110,44 @@ class LinuxIsolationTests(unittest.TestCase):
         result = self.execute(launcher, "import json,os,sys; print(json.dumps([os.environ.get('HOME'),sys.argv[1]]))", argument)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [os.environ.get("HOME"), argument])
+
+    def test_gpu_passthrough_binds_individual_nodes_after_private_dev(self):
+        devices = [Path("/dev/dri/card0"), Path("/dev/dri/renderD128"),
+                   Path("/dev/nvidiactl"), Path("/dev/nvidia-caps/nvidia-cap1")]
+        with patch("gaybar_tools.isolation._gpu_device_nodes", return_value=devices):
+            command = bubblewrap_command(sys.executable, self.paths)
+        device_mounts = [(command[index + 1], command[index + 2])
+                         for index, argument in enumerate(command) if argument == "--dev-bind-try"]
+        self.assertEqual(device_mounts, [(str(device), str(device)) for device in devices])
+        self.assertLess(command.index("--dev"), command.index("--dev-bind-try"))
+        self.assertNotIn("--dev-bind", command)
+        # A whole /dev, /dev/dri or NVIDIA directory must never become a
+        # writable host filesystem mount just to provide device access.
+        writable = [(command[index + 1], command[index + 2])
+                    for index, argument in enumerate(command) if argument == "--bind"]
+        self.assertEqual(writable, [(str(self.root), str(self.root)), ("/tmp", "/tmp")])
+        with patch("gaybar_tools.isolation._gpu_device_nodes", return_value=[]):
+            self.assertNotIn("--dev-bind-try", bubblewrap_command(sys.executable, self.paths))
+
+    def test_available_gpu_character_devices_are_visible_inside_sandbox(self):
+        devices = _gpu_device_nodes()
+        if not devices:
+            self.skipTest("当前环境没有可透传的 GPU 设备节点")
+        expected = {str(path): path.stat().st_rdev for path in devices}
+        launcher = prepare_browser_executable(sys.executable, self.paths)
+        script = """import json,pathlib,stat,sys
+devices={}
+for name in sys.argv[1:]:
+    metadata=pathlib.Path(name).stat()
+    if not stat.S_ISCHR(metadata.st_mode): raise SystemExit('not a character device: '+name)
+    devices[name]=metadata.st_rdev
+mounts={line.split()[4] for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines()}
+if {'/dev/dri','/dev/nvidia-caps'} & mounts: raise SystemExit('host device directory was mounted')
+print(json.dumps(devices))
+"""
+        result = self.execute(launcher, script, *devices)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), expected)
 
     def test_external_writes_and_symlink_escape_fail_but_project_and_tmp_work(self):
         if self.base.is_relative_to(Path("/tmp")):

@@ -1,7 +1,9 @@
 """Linux browser filesystem confinement, enforced before Chromium starts.
 
 The browser sees the host filesystem read-only, with writable mounts only for
-the project and /tmp. A private PID namespace prevents access to another
+the project and /tmp. Existing GPU character devices are exposed individually
+inside a private /dev; their host directories stay read-only. A private PID
+namespace prevents access to another
 process's host root through /proc. HOME is preserved. This protects existing
 Linux NSS databases even when Chromium ignores the XDG environment variables.
 
@@ -13,8 +15,10 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +28,38 @@ from .paths import AppPaths
 
 class IsolationError(RuntimeError):
     """Required filesystem isolation is unavailable; no browser was started."""
+
+
+def _gpu_device_nodes(device_root: Path = Path("/dev")) -> list[Path]:
+    """Find existing graphics devices without exposing writable host directories.
+
+    DRM nodes cover Mesa and NVIDIA's Wayland/GBM path. The NVIDIA driver also
+    uses its own character devices. Never bind a matching regular file, a
+    symlink, or a path whose parents redirect outside the device tree.
+    """
+    inventories = (
+        (device_root / "dri", r"(?:card|renderD)[0-9]+"),
+        (device_root, r"nvidia(?:[0-9]+|ctl|-modeset|-uvm|-uvm-tools)"),
+        (device_root / "nvidia-caps", r"nvidia-cap[0-9]+"),
+    )
+    devices: list[Path] = []
+    for directory, pattern in inventories:
+        try:
+            candidates = list(directory.iterdir())
+        except OSError:
+            continue
+        for candidate in candidates:
+            if not re.fullmatch(pattern, candidate.name):
+                continue
+            try:
+                if (stat.S_ISCHR(candidate.lstat().st_mode)
+                        and candidate.resolve(strict=True) == candidate.absolute()):
+                    devices.append(candidate)
+            except (OSError, RuntimeError):
+                # Hot-unplug, inaccessible nodes, and symlink loops must not
+                # prevent a browser without hardware acceleration from starting.
+                continue
+    return sorted(devices)
 
 
 def bubblewrap_command(executable: str, paths: AppPaths, *, bubblewrap: str | None = None) -> list[str]:
@@ -40,11 +76,17 @@ def bubblewrap_command(executable: str, paths: AppPaths, *, bubblewrap: str | No
     executable_path = Path(executable).resolve()
     if not executable_path.is_file():
         raise IsolationError(f"浏览器可执行文件不存在：{executable_path}")
-    return [str(Path(tool).resolve()), "--die-with-parent", "--new-session",
-            "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
-            "--ro-bind", "/", "/", "--bind", str(root), str(root),
-            "--bind", "/tmp", "/tmp", "--dev", "/dev", "--proc", "/proc",
-            "--chdir", str(root), "--", str(executable_path)]
+    command = [str(Path(tool).resolve()), "--die-with-parent", "--new-session",
+               "--unshare-user", "--unshare-pid", "--cap-drop", "ALL",
+               "--ro-bind", "/", "/", "--bind", str(root), str(root),
+               "--bind", "/tmp", "/tmp", "--dev", "/dev"]
+    for device in _gpu_device_nodes():
+        # --dev creates a minimal device tree, hiding the GPU otherwise.
+        # Bind only existing character nodes: parent directories are created
+        # inside the private /dev rather than made writable on the host.
+        command.extend(("--dev-bind-try", str(device), str(device)))
+    command.extend(("--proc", "/proc", "--chdir", str(root), "--", str(executable_path)))
+    return command
 
 
 def prepare_browser_executable(executable: str, paths: AppPaths) -> str:
