@@ -37,6 +37,7 @@ class Worker(threading.Thread):
         self.browser = None
         self._last_ready = None
         self._last_url = ""
+        self._last_detection_error = ""
         self.log_file = paths.logs / (datetime.now().strftime("session-%Y%m%d-%H%M%S") + ".log")
 
     def emit(self, kind, value):
@@ -67,7 +68,19 @@ class Worker(threading.Thread):
         self.stop_event.set()
 
     def update_ready(self):
-        ready = bool(self.browser and self.browser.poll_ready())
+        try:
+            ready = bool(self.browser and self.browser.poll_ready())
+            self._last_detection_error = ""
+        except Exception as exc:
+            ready = False
+            message = str(exc)
+            if self.browser:
+                key = self.browser.settings.api_key
+                if key:
+                    message = message.replace(key, "[已隐藏]")
+            if message != self._last_detection_error and not self.stop_event.is_set():
+                self.log("页面检测提示：" + message)
+            self._last_detection_error = message
         url = self.browser.current_url if self.browser else ""
         if (ready, url) != (self._last_ready, self._last_url):
             self._last_ready, self._last_url = ready, url

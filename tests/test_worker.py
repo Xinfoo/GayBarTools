@@ -50,6 +50,14 @@ class WorkerCancellationTests(unittest.TestCase):
             self.finish_after_pending_command()
         solver.assert_not_called()
 
+    def test_start_without_a_browser_reports_how_to_continue(self):
+        self.worker.command("start", self.settings)
+        with patch("gaybar_tools.worker.Workflow") as workflow:
+            self.finish_after_pending_command()
+        workflow.assert_not_called()
+        states = [value for kind, value in self.events.queue if kind == "state"]
+        self.assertTrue(any("请先打开浏览器" in value for value in states))
+
     def test_shutdown_before_dequeue_discards_pending_launch(self):
         self.worker.browser = Mock()
         self.worker.command("launch", self.settings)
@@ -88,6 +96,20 @@ class WorkerCancellationTests(unittest.TestCase):
         self.assertTrue(demo_paths.profile.is_relative_to(self.paths.runtime))
         self.assertEqual(demo_paths.browsers, self.paths.browsers)
         browser.return_value.launch.assert_called_once_with(self.worker.demo_url)
+
+    def test_detection_errors_are_reported_once_without_leaking_key(self):
+        self.worker.browser = Mock()
+        self.worker.browser.settings = AppSettings(api_key="private-test-key")
+        self.worker.browser.current_url = "https://example.test/course"
+        self.worker.browser.poll_ready.side_effect = ValueError("检测失败 private-test-key")
+        self.worker._last_ready = True
+        self.worker.update_ready()
+        self.worker.update_ready()
+        events = list(self.events.queue)
+        messages = [value for kind, value in events if kind == "log"]
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn("private-test-key", messages[0])
+        self.assertIn(("ready", False), events)
 
 
 if __name__ == "__main__":

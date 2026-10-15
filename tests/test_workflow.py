@@ -61,6 +61,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser = Mock()
         self.browser.poll_ready.return_value = True
         self.browser.chapter_key.return_value = "chapter-1"
+        self.browser.prepare_start.return_value = "video"
         self.browser.chapter_kind.return_value = "video"
         self.browser.open_quiz.return_value = True
         self.browser.quiz_completed.return_value = False
@@ -104,7 +105,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.apply_answers.assert_not_called()
 
     def test_unknown_type_is_never_advanced(self):
-        self.browser.chapter_kind.return_value = "unknown"
+        self.browser.prepare_start.return_value = "unknown"
         with self.assertRaises(WorkflowError):
             self.workflow().run()
         self.browser.open_quiz.assert_not_called()
@@ -117,12 +118,20 @@ class WorkflowTests(unittest.TestCase):
 
     def test_two_chapters_complete(self):
         self.browser.chapter_key.side_effect = ["chapter-1", "chapter-2"]
-        self.browser.chapter_kind.side_effect = ["video", "document"]
+        self.browser.prepare_start.return_value = "video"
+        self.browser.chapter_kind.return_value = "document"
         self.browser.next_chapter.side_effect = [True, False]
         self.assertEqual(self.workflow().run(), 2)
         self.browser.watch_video.assert_called_once()
         self.browser.read_document.assert_called_once()
         self.assertEqual(self.browser.submit_quiz.call_count, 2)
+
+    def test_explicit_start_uses_content_even_without_background_readiness(self):
+        self.browser.poll_ready.return_value = False
+        self.assertEqual(self.workflow().run(), 1)
+        self.browser.prepare_start.assert_called_once()
+        self.browser.watch_video.assert_called_once()
+        self.browser.poll_ready.assert_not_called()
 
     def test_demo_answers_rejected_on_remote_origin(self):
         self.browser.current_url = "https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=1"
@@ -131,7 +140,7 @@ class WorkflowTests(unittest.TestCase):
             solver.solve(self.browser.get_questions())
 
     def test_resume_submitted_quiz_does_not_request_or_submit_again(self):
-        self.browser.chapter_kind.return_value = "quiz"
+        self.browser.prepare_start.return_value = "quiz"
         self.browser.quiz_completed.return_value = True
         self.assertEqual(self.workflow().run(), 1)
         self.solver.solve.assert_not_called()

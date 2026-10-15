@@ -67,6 +67,8 @@ class BrowserSession:
         self._submitting = False
         self._last_video_log = 0.0
         self._chapter_page_selected = False
+        self._page_order: list[Any] = []
+        self._attached_pages: set[Any] = set()
         self._session_tmp: tempfile.TemporaryDirectory[str] | None = None
 
     @property
@@ -227,6 +229,11 @@ class BrowserSession:
                                f" 原因：{exc}") from exc
 
     def _attach_page(self, page: Any) -> None:
+        if page in self._attached_pages:
+            return
+        self._attached_pages.add(page)
+        if page not in self._page_order:
+            self._page_order.append(page)
         page.on("dialog", self._on_dialog)
 
     def _on_dialog(self, dialog: Any) -> None:
@@ -288,7 +295,10 @@ class BrowserSession:
             message, self._unexpected_dialog = self._unexpected_dialog, ""
             raise BrowserError(f"网页弹窗需要人工处理：{message}")
         for frame in self._frames():
-            if re.search(r"(?:passport2?\.|/login(?:[/?]|$)|/loginpage|/sso/login)", frame.url, re.I):
+            if not self._frame_visible(frame):
+                continue
+            login = re.search(r"(?:passport2?\.|/login(?:[/?]|$)|/loginpage|/sso/login)", frame.url, re.I)
+            if login and frame.parent_frame is None:
                 raise BrowserError("登录状态已失效，请手动登录后再开始。")
             captcha = self._first_visible(
                 "#captcha, #captchaBox, .captcha-box, .geetest_panel, .nc-container, "
@@ -300,54 +310,130 @@ class BrowserSession:
                 body = frame.locator("body").inner_text(timeout=1000)
             except Exception:
                 continue
+            if login and (_clean(body) or self._first_visible("input[type=password]", root=frame) is not None):
+                raise BrowserError("登录状态已失效，请手动登录后再开始。")
             if re.search(r"访问过于频繁|请求过于频繁|账号异常|帐号异常|请完成安全验证|请先登录|登录已过期", body):
                 raise BrowserError("网页要求人工处理登录、安全验证或访问异常。")
 
-    def _is_chapter_page(self, page: Any) -> bool:
+    @staticmethod
+    def _frame_visible(frame: Any) -> bool:
+        """Ignore dormant authentication/verification frames in page chrome."""
         try:
-            if page.is_closed():
-                return False
-            query = {key.lower(): value for key, value in parse_qs(urlparse(page.url).query).items()}
-            for frame in page.frames:
-                if not frame.is_detached() and _CHAPTER_URL.search(frame.url):
-                    return True
-            if not (query.get("chapterid") or query.get("knowledgeid")):
-                return False
-            for frame in page.frames:
-                if frame.locator("video, .ans-attach-online, #iframe, #content-frame, #iframeBox, .TiMu, [data-question-id], .chapter-content").count():
-                    return True
-                if frame.get_by_text(_QUIZ_TAB, exact=True).count():
-                    return True
-            return False
+            while frame.parent_frame is not None:
+                element = frame.frame_element()
+                try:
+                    if not element.is_visible():
+                        return False
+                finally:
+                    element.dispose()
+                frame = frame.parent_frame
+            return True
         except Exception:
+            # A frame that detached while being inspected is no longer a
+            # visible login or verification screen for the user to handle.
             return False
+
+    def _is_chapter_page(self, page: Any) -> bool:
+        if page.is_closed():
+            return False
+        identified = content = False
+        # A course may be embedded in a generic outer page. Inspect every
+        # frame's URL and visible contents independently, so a navigating or
+        # detached sibling cannot hide a usable chapter further down the tree.
+        for frame in page.frames:
+            try:
+                if frame.is_detached() or not self._frame_visible(frame):
+                    continue
+                parts = urlparse(frame.url)
+                if _CHAPTER_URL.search(parts.path):
+                    return True
+                query = {key.lower(): value for key, value in parse_qs(parts.query).items()}
+                identified = identified or bool(query.get("chapterid") or query.get("knowledgeid"))
+                if self._first_visible(
+                        ".ans-attach-online, .TiMu, [data-question-id], .chapter-content", root=frame) is not None:
+                    return True
+                tabs = frame.get_by_text(_QUIZ_TAB, exact=True)
+                if any(self._visible(tabs.nth(index)) for index in range(min(tabs.count(), 100))):
+                    return True
+                content = content or self._first_visible(
+                    "video, #iframe, #content-frame, #iframeBox", root=frame) is not None
+            except Exception:
+                # Frame navigation is transient; continue inspecting siblings.
+                continue
+        return identified and content
+
+    def _open_pages(self) -> list[Any]:
+        if self._context is None:
+            return []
+        # The synchronous Playwright API dispatches page/frame/dialog events
+        # only while an API call runs. Merely reading context.pages and URL
+        # properties during idle polling can otherwise leave a new tab unseen.
+        pump = self._page
+        if pump is None:
+            pump = next(iter(self._context.pages), None)
+        if pump is not None:
+            try:
+                pump.wait_for_timeout(1)
+            except Exception:
+                if not pump.is_closed():
+                    raise
+        pages = [page for page in self._context.pages if not page.is_closed()]
+        for page in pages:
+            self._attach_page(page)
+        if self._chapter_page_selected and self._page in self._page_order:
+            # Keep the order even after tabs close: completing or closing a
+            # newer course must not resume an older course automatically.
+            current_index = self._page_order.index(self._page)
+            pages = [page for page in pages if self._page_order.index(page) >= current_index]
+        return pages
+
+    def _select_page(self, page: Any) -> None:
+        if page is not self._page:
+            self._page, self._mouse = page, (0.0, 0.0)
+            self._question_controls.clear()
+            self._questions.clear()
+            self.log("已跟随课程章节页面。")
 
     def poll_ready(self) -> bool:
         self._check_stop()
         if self._context is None:
             return False
         try:
-            pages = [page for page in self._context.pages if not page.is_closed()]
+            pages = self._open_pages()
             candidates = [page for page in pages if self._is_chapter_page(page)]
-            if self._chapter_page_selected and self._page in pages:
-                # A completed course must not silently fall back to an older
-                # course tab. Newer tabs may still be followed automatically.
-                current_index = pages.index(self._page)
-                candidates = [page for page in candidates if pages.index(page) >= current_index]
             if not candidates:
                 return False
-            selected = candidates[-1]
-            if selected is not self._page:
-                self._page, self._mouse = selected, (0.0, 0.0)
-                self._question_controls.clear()
-                self.log("已跟随课程章节页面。")
+            self._select_page(candidates[-1])
             self._chapter_page_selected = True
             self._guard()
             return True
-        except StopRequested:
+        except BrowserError:
             raise
-        except Exception:
-            return False
+        except Exception as exc:
+            raise BrowserError("读取浏览器页面失败，请稍候重试或重新打开浏览器。") from exc
+
+    def prepare_start(self) -> str:
+        """Inspect visible content on an explicit start, without a URL gate."""
+        self._check_stop()
+        if self._context is None:
+            raise BrowserError("请先打开浏览器，并手动进入课程章节。")
+        try:
+            pages = self._open_pages()
+            if not pages:
+                raise BrowserError("当前课程页面已关闭，请打开新的课程章节后再开始。")
+            # Explicit start must inspect the latest page even when an older
+            # tab matches the automatic URL heuristics. Otherwise a valid
+            # new reader/player could accidentally start the older course.
+            self._select_page(pages[-1])
+            self._guard()
+            kind = self.chapter_kind()
+            if kind != "unknown":
+                self._chapter_page_selected = True
+            return kind
+        except BrowserError:
+            raise
+        except Exception as exc:
+            raise BrowserError("读取浏览器页面失败，请稍候重试或重新打开浏览器。") from exc
 
     def chapter_key(self) -> str:
         self._guard()
@@ -861,6 +947,8 @@ class BrowserSession:
         temporary, self._session_tmp = self._session_tmp, None
         self._context = self._playwright = self._page = None
         self._chapter_page_selected = False
+        self._page_order.clear()
+        self._attached_pages.clear()
         self._question_controls.clear()
         self._questions.clear()
         try:

@@ -118,7 +118,7 @@ class BrowserIntegrationTests(unittest.TestCase):
 
     def test_two_chapters_use_native_video_inner_scroll_and_confirmed_submission(self):
         self.launch("home.html")
-        self.assertFalse(self.browser.poll_ready(), "主页不应启用开始刷课")
+        self.assertFalse(self.browser.poll_ready(), "主页不应被识别为课程章节")
         self.browser.page.get_by_test_id("open-course").click()
         self.wait_ready()
         first_key = self.browser.chapter_key()

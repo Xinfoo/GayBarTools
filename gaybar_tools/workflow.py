@@ -31,22 +31,23 @@ class Workflow:
         completed = 0
         while completed < self.settings.max_chapters:
             self.check_stop()
-            if not self.browser.poll_ready():
-                raise WorkflowError("当前页面不是可识别的课程章节，请手动进入章节后重试。")
+            # An explicit Start chooses a page once. Later iterations inspect
+            # the chapter already selected by next_chapter, rather than switch
+            # to an unrelated tab opened while the task was running.
+            kind = self.browser.chapter_kind() if visited else self.browser.prepare_start()
+            if kind not in {"video", "document", "quiz"}:
+                raise WorkflowError("当前页面未识别到视频、文档或学习检测，请进入课程章节后重试；可查看诊断截图。")
             key = self.browser.chapter_key()
             if not key or key in visited:
                 raise WorkflowError("章节没有变化或发生循环，已停止。")
             visited.add(key)
             self.state(f"正在处理第 {completed + 1} 节")
-            kind = self.browser.chapter_kind()
             if kind == "video":
                 self.state("视频正常播放中")
                 self.browser.watch_video()
             elif kind == "document":
                 self.state("阅读静态页面")
                 self.browser.read_document()
-            elif kind != "quiz":
-                raise WorkflowError("当前章节类型无法识别，已停止，请查看诊断截图。")
             self.check_stop()
             if kind != "quiz" and not self.browser.open_quiz():
                 raise WorkflowError("未找到“学习检测”入口，已停止。")

@@ -82,7 +82,7 @@ class Application:
         actions.pack(fill="x", pady=16)
         self.launch_button = ttk.Button(actions, text="1  打开浏览器", command=lambda: self.send("launch"))
         self.launch_button.pack(side="left")
-        self.start_button = ttk.Button(actions, text="2  开始刷课", style="Start.TButton", command=lambda: self.send("start"), state="disabled")
+        self.start_button = ttk.Button(actions, text="2  开始刷课", style="Start.TButton", command=lambda: self.send("start"))
         self.start_button.pack(side="left", padx=10)
         self.stop_button = ttk.Button(actions, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left")
@@ -153,7 +153,9 @@ class Application:
 
     def update_buttons(self):
         self.launch_button.configure(state="disabled" if self.busy or self.closing else "normal")
-        self.start_button.configure(state="normal" if self.ready and not self.busy and not self.closing else "disabled")
+        # Page detection is advisory. Sites can wrap a chapter in a new URL or
+        # iframe; the worker validates the selected page when Start is clicked.
+        self.start_button.configure(state="disabled" if self.busy or self.closing else "normal")
         self.stop_button.configure(state="normal" if self.busy and not self.closing else "disabled")
         self.test_button.configure(state="disabled" if self.busy or self.demo_url or self.closing else "normal")
         self.save_button.configure(state="disabled" if self.closing else "normal")
