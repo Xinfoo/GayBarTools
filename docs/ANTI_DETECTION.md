@@ -15,7 +15,7 @@
 | 浏览器输入事件 | 使用 Playwright 的 `mouse.move()`、`mouse.click()`、`mouse.wheel()` 操作浏览器 | 常规填答通过点击控件完成，没有通过 JavaScript 直接写入选中状态 |
 | 分段滚轮与随机间隔 | 每次向下发送 **650～1000** 的滚轮位移，随后等待 **0.18～0.32 秒** | 当前已使用加快后的滚动参数；实际滚动距离还受页面容器和浏览器行为影响 |
 
-普通播放按钮、选择答案、提交、网页内提交确认按钮和“下一节”都使用 `_click()`。该方法先确认控件可见、可用、能够接收点击，并在必要时滚入视野，再执行随机落点和鼠标输入。同页视频和文档从上到下全部完成后，统一点击右下角“下一节”，再识别是否进入答题页，不依赖固定的“2 学习检测”页签。
+普通播放按钮、选择答案、提交、网页内提交确认按钮和“下一节”都使用 `_click()`。该方法先确认控件可见、可用、能够接收点击，并在必要时滚入视野，再执行随机落点和鼠标输入。同页视频和文档从上到下全部完成后，统一点击右下角“下一节”，再根据实际内容识别后续页面。
 
 这些随机参数各自独立抽取，尚未建立按用户习惯、题目难度或阅读字数调整操作节奏的模型。
 
@@ -84,9 +84,9 @@
 | 测试文件 | 核对内容 |
 | --- | --- |
 | [test_browser_integration.py](../tests/test_browser_integration.py) | 视频完整自然播放、没有 seek、倍速为 1；选项、提交、网页内确认与下一节的输入事件；两章完整流程 |
-| [test_next_page_integration.py](../tests/test_next_page_integration.py) | 无检测页签、同 URL 视图切换、内容页连续出现、已提交检测跳过重复作答及隐藏旧内容过滤 |
+| [test_next_page_integration.py](../tests/test_next_page_integration.py) | 同 URL 视图切换、内容页连续出现、已提交检测跳过重复作答及隐藏旧内容过滤 |
 | [test_next_warning_integration.py](../tests/test_next_warning_integration.py) | 未完成任务点提示框内下一节的真实点击、隐藏模板过滤、一次确认，以及弹层关闭后仍等待新内容 |
-| [test_retained_video_quiz_integration.py](../tests/test_retained_video_quiz_integration.py) | 残留或被覆盖播放器不阻挡章节答题、可变页签名称、隐藏原生选项及内部滚动题目的真实输入 |
+| [test_retained_video_quiz_integration.py](../tests/test_retained_video_quiz_integration.py) | 残留或被覆盖播放器不阻挡章节答题、隐藏原生选项及内部滚动题目的真实输入 |
 | [test_aria_hidden_options_integration.py](../tests/test_aria_hidden_options_integration.py) | 真实 DOM 对应的可见 aria-hidden 选项、单选与多选状态标记、真实鼠标填写及本地提交 |
 | [test_preload_none_video_integration.py](../tests/test_preload_none_video_integration.py) | 未预载及延迟启动视频的单次播放点击、正常播放与自然结束、空播放器不提前放行 |
 | [test_video_quiz_integration.py](../tests/test_video_quiz_integration.py) | 中途插题的选项、提交和继续学习输入事件；连续插题、嵌套 iframe 与局部截图；答题后自然播放结束、无 seek 和倍速变化 |
