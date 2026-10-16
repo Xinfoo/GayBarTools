@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>视觉可用的 aria-hidden 选项 · 本地回归</title>
+<link rel="stylesheet" href="style.css"><style>
+main{max-width:1000px;margin:auto}.document-viewer{height:300px}.document-page{min-height:1000px}
+.newTiMu{overflow:auto;padding:18px 0}.Zy_ulTop{width:100%}.Zy_ulTop li{display:flex;align-items:center;gap:12px;padding:14px;cursor:pointer}
+.num_option,.num_option_dx{display:inline-block;min-width:24px}.check_answer,.check_answer_dx{background:#4387ed;color:white}.after{color:inherit;text-decoration:none;flex:1}
+.old-transparent{position:absolute;top:0;left:0;opacity:0;pointer-events:none}.old-css-hidden{display:none}
+</style></head><body><main><h1>内容与章节测验</h1>
+<section id="document-panel"><div class="document-viewer" data-document-viewer tabindex="0"><article class="document-page"><h2>本地回归文档</h2><p>完成内容后，通过下一节读取视觉可用的题目选项。</p><p style="margin-top:700px">内容结束</p></article></div></section>
+<section id="quiz-panel" hidden><form id="quiz-form"></form><div id="submission-result" role="status"></div></section>
+<nav class="chapter-nav"><button id="next-chapter" disabled>下一节</button></nav></main>
+<script>
+const definitions=[
+  {id:'local-single-one',kind:'single',title:'1【单选题】第一道本地结构验证题',options:['第一题选项一','第一题选项二','第一题选项三']},
+  {id:'local-single-two',kind:'single',title:'2【单选题】第二道本地结构验证题',options:['第二题选项一','第二题选项二','第二题选项三','第二题选项四']},
+  {id:'local-single-three',kind:'single',title:'3【单选题】第三道本地结构验证题',options:['第三题选项一','第三题选项二','第三题选项三','第三题选项四']},
+  {id:'local-boolean',kind:'boolean',title:'4【判断题】可见选项应按实际展示状态识别',options:['对','错']},
+  {id:'local-multiple',kind:'multiple',title:'5【多选题】第五道本地结构验证题',options:['多选题选项一','多选题选项二','多选题选项三','多选题选项四']}
+];
+const form=document.getElementById('quiz-form'),next=document.getElementById('next-chapter');
+const metrics={documentAtBottom:false,inputClicks:0,inputTrusted:[],answers:{},submitClicks:0,submitTrusted:[],nextTrusted:[],oldClicks:0,submitted:false};
+let atQuiz=false;
+function persist(){localStorage.setItem('aria-hidden-options-metrics',JSON.stringify(metrics));}
+function questionHTML(question,oldClass=''){
+  const role=question.kind==='multiple'?'checkbox':'radio';
+  const markerClass=question.kind==='multiple'?'num_option_dx':'num_option';
+  const aria=question.kind==='boolean'?'':' aria-hidden="true"';
+  const rows=question.options.map((text,index)=>{
+    const label=String.fromCharCode(65+index);
+    return `<li class="font-cxsecret ${role==='checkbox'?'before-after-checkbox':'before-after'}" role="${role}"><label class="fl before"><span class="${markerClass} choice${question.id}" name="answer${question.id}">${label}</span></label><a class="fl after">${text}</a></li>`;
+  }).join('');
+  return `<section class="TiMu newTiMu ${oldClass}" id="${question.id}"><h3 class="Zy_TItle">${question.title}</h3><ul class="Zy_ulTop w-top fl"${aria}>${rows}</ul></section>`;
+}
+form.innerHTML=definitions.map(question=>questionHTML(question)).join('')
+  +questionHTML({id:'old-display-none',kind:'single',title:'【单选题】CSS隐藏旧数据不可回答',options:['旧选项一','旧选项二']},'old-css-hidden')
+  +questionHTML({id:'old-opacity-zero',kind:'single',title:'【单选题】透明旧数据不可回答',options:['旧选项一','旧选项二']},'old-transparent')
+  +'<button type="button" id="submit-quiz">提交</button>';
+form.addEventListener('click',event=>{
+  const row=event.target.closest('li[role]');if(!row)return;
+  const question=row.closest('.TiMu');
+  if(question.id.startsWith('old-')){metrics.oldClicks++;persist();return;}
+  const marker=row.querySelector('.num_option,.num_option_dx');
+  if(row.getAttribute('role')==='checkbox')marker.classList.toggle('check_answer_dx');
+  else{question.querySelectorAll('.num_option,.num_option_dx').forEach(option=>option.classList.remove('check_answer'));marker.classList.add('check_answer');}
+  metrics.inputClicks++;metrics.inputTrusted.push(event.isTrusted);
+  metrics.answers[question.id]=[...question.querySelectorAll('.check_answer,.check_answer_dx')].map(option=>option.textContent);
+  persist();
+});
+document.getElementById('submit-quiz').addEventListener('click',event=>{
+  metrics.submitClicks++;metrics.submitTrusted.push(event.isTrusted);
+  if(!definitions.every(question=>metrics.answers[question.id]?.length)){persist();return;}
+  metrics.submitted=true;form.hidden=true;
+  const result=document.getElementById('submission-result');result.className='submit-success';result.textContent='提交成功 · 已完成本节测验';
+  next.disabled=false;persist();
+});
+document.querySelector('.document-viewer').addEventListener('scroll',event=>{
+  const viewer=event.target;
+  if(viewer.scrollTop+viewer.clientHeight>=viewer.scrollHeight-3){metrics.documentAtBottom=true;next.disabled=false;persist();}
+});
+function showQuiz(){atQuiz=true;document.getElementById('document-panel').hidden=true;document.getElementById('quiz-panel').hidden=false;next.disabled=true;}
+next.addEventListener('click',event=>{metrics.nextTrusted.push(event.isTrusted);persist();if(atQuiz)location.href='complete.html';else showQuiz();});
+if(new URLSearchParams(location.search).get('start')==='quiz')showQuiz();
+persist();
+</script></body></html>

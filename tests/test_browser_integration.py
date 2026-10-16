@@ -99,7 +99,12 @@ class BrowserIntegrationTests(unittest.TestCase):
         return self.browser.page.evaluate("JSON.parse(localStorage.getItem('gaybar-demo-metrics') || '{}')")
 
     def answer_and_submit(self):
-        self.assertTrue(self.browser.open_quiz())
+        previous_url, previous_key = self.browser.current_url, self.browser.chapter_key()
+        self.assertEqual(self.browser.page.get_by_test_id("quiz-tab").count(), 0)
+        self.assertTrue(self.browser.next_chapter(), "内容完成后应通过下一节进入检测")
+        self.assertEqual(self.browser.current_url, previous_url, "演示用例只更换内嵌活动，外层章节地址保持不变")
+        self.assertNotEqual(self.browser.chapter_key(), previous_key)
+        self.assertEqual(self.browser.chapter_kind(), "quiz")
         questions = self.browser.get_questions()
         self.assertEqual(len(questions), 3)
         self.assertEqual({question.kind for question in questions}, {"single", "multiple", "boolean"})
@@ -192,7 +197,9 @@ class BrowserIntegrationTests(unittest.TestCase):
         self.browser.page.get_by_test_id("course-complete").wait_for(state="visible")
         for chapter in ("1", "2"):
             navigation = self.metrics()[chapter]["navigation"]
-            self.assertTrue(navigation["quizTabTrusted"])
+            self.assertTrue(navigation["contentNextTrusted"])
+            self.assertTrue(navigation["quizNextTrusted"])
+            self.assertEqual(navigation["nextClicks"], 2)
             self.assertTrue(navigation["nextTrusted"])
 
     def test_workflow_completes_both_chapters(self):
@@ -203,7 +210,7 @@ class BrowserIntegrationTests(unittest.TestCase):
         self.wait_ready()
         solver = DemoSolver(self.browser, self.base_url)
         completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
-        self.assertEqual(completed, 2)
+        self.assertEqual(completed, 4)
         self.assertEqual(self.browser.page.url, f"{self.base_url}/complete.html")
         self.assert_quiz_events(self.metrics()["1"]["quiz"])
         self.assert_quiz_events(self.metrics()["2"]["quiz"])
@@ -258,7 +265,7 @@ class BrowserIntegrationTests(unittest.TestCase):
             with patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
                 completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
 
-            self.assertEqual(completed, 2)
+            self.assertEqual(completed, 4)
             self.assertEqual(len(requests), 2)
             self.assertEqual(self.browser.page.url, f"{self.base_url}/complete.html")
             for chapter in ("1", "2"):
@@ -307,7 +314,7 @@ class BrowserIntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
             completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
 
-        self.assertEqual(completed, 2)
+        self.assertEqual(completed, 4)
         self.assertEqual(len(requests), 6, "首章可在第三次重试成功；下一章应重新计算重试次数")
         for start, end in ((0, 4), (4, 6)):
             original = requests[start]["messages"][:2]

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>保留播放器的章节测验 · 本地回归</title>
+<link rel="stylesheet" href="style.css"><style>main{max-width:1000px;margin:auto}.video-stage{width:640px;height:360px;margin:15px 0}.video-stage video{height:100%;width:100%}.fl{display:inline-block}.option{margin-right:12px}.custom-assessment-panel label{display:block;padding:18px}</style>
+</head><body><main><h1>动态章节活动</h1><nav><span id="activity-caption">1 课程内容</span></nav>
+<div id="retained-player"><div class="video-stage"><video id="lesson-video" controls preload="auto" src="lesson.webm"></video><button class="vjs-big-play-button" aria-label="播放视频">播放</button></div></div>
+<section id="quiz-panel" hidden><form id="assessment-form"></form><p id="submission-result" role="status"></p></section>
+<p id="media-status" role="status">等待完整播放</p><nav class="chapter-nav"><button id="next-chapter" disabled>下一节</button></nav>
+<script>
+const params=new URLSearchParams(location.search),style=params.get('style')||'chaoxing';
+const video=document.getElementById('lesson-video'),panel=document.getElementById('quiz-panel'),form=document.getElementById('assessment-form'),next=document.getElementById('next-chapter');
+const metrics={ended:false,seekEvents:0,playbackRate:1,inputTrusted:[],nextTrusted:[],submitTrusted:[],submitted:false};
+let atQuiz=false;
+function persist(){localStorage.setItem('retained-video-quiz-metrics',JSON.stringify(metrics));}
+if(style==='chaoxing'){
+  form.innerHTML='<section class="TiMu" id="retained-question"><h3 class="Zy_TItle">1【单选题】完成视频后出现章节题目，程序应怎样继续？</h3><ul class="Zy_ulTop"><li role="radio" aria-checked="false" data-value="A"><div class="fl option">A.</div><div class="fl">只检查页签的固定名称</div></li><li role="radio" aria-checked="false" data-value="B"><div class="fl option">B.</div><div class="fl">根据可见题干和选项识别答题页</div></li></ul></section>';
+}else{
+  // Deliberately use none of the adapter's known question/title classes.
+  form.innerHTML='<article class="custom-assessment-panel"><h3 class="custom-assessment-title">1. [单选题] 完成视频后出现章节题目，程序应怎样继续？</h3><label><input type="radio" name="retained-answer" value="A">A. 只检查页签的固定名称</label><label><input type="radio" name="retained-answer" value="B">B. 根据可见题干和选项识别答题页</label></article>';
+}
+form.insertAdjacentHTML('beforeend','<button type="button" id="submit-quiz">提交</button>');
+form.addEventListener('click',event=>{
+  const item=event.target.closest('[role=radio]');
+  if(item){form.querySelectorAll('[role=radio]').forEach(option=>option.setAttribute('aria-checked',String(option===item)));metrics.answer=item.dataset.value;metrics.inputTrusted.push(event.isTrusted);persist();}
+  if(event.target.matches('input[type=radio]')){metrics.answer=event.target.value;metrics.inputTrusted.push(event.isTrusted);persist();}
+});
+document.getElementById('submit-quiz').addEventListener('click',event=>{
+  metrics.submitTrusted.push(event.isTrusted);
+  if(!metrics.answer){persist();return;}
+  metrics.submitted=true;form.hidden=true;
+  const result=document.getElementById('submission-result');result.className='submit-success';result.textContent='提交成功 · 已完成章节测验';
+  next.disabled=false;persist();
+});
+function showQuiz(){
+  atQuiz=true;panel.hidden=false;next.disabled=true;
+  document.getElementById('activity-caption').textContent=style==='chaoxing'?'2 章节测验':'4 随堂练习';
+  if(params.get('clip')==='1')document.getElementById('retained-player').style.cssText='height:0;overflow:hidden';
+  if(params.get('cover')==='1'){
+    const box=video.getBoundingClientRect();
+    panel.style.cssText=`position:absolute;left:${box.left+scrollX}px;top:${box.top+scrollY}px;width:${box.width}px;min-height:${box.height}px;background:white;z-index:5`;
+    // This remains an independent assessment outside the player wrapper. Its
+    // next control stays usable after the assessment covers the old player.
+    next.style.cssText='position:relative;z-index:6';
+  }
+  persist();
+}
+document.querySelector('.vjs-big-play-button').addEventListener('click',()=>video.play());
+video.addEventListener('play',()=>document.querySelector('.vjs-big-play-button').hidden=true);
+video.addEventListener('seeking',()=>{metrics.seekEvents++;persist();});
+video.addEventListener('ratechange',()=>{metrics.playbackRate=video.playbackRate;persist();});
+video.addEventListener('ended',()=>{metrics.ended=true;metrics.duration=video.duration;metrics.currentTime=video.currentTime;next.disabled=false;document.getElementById('media-status').textContent='视频已自然播放结束';persist();});
+next.addEventListener('click',event=>{
+  metrics.nextTrusted.push(event.isTrusted);persist();
+  if(atQuiz){location.href='complete.html';return;}
+  if(params.get('mode')==='tab-only'){document.getElementById('activity-caption').textContent='2 章节测验';next.disabled=true;return;}
+  showQuiz();
+});
+if(params.get('start')==='quiz')showQuiz();
+persist();
+</script></body></html>

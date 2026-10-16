@@ -96,14 +96,14 @@ def main(argv=None):
             # Never replace the user's saved login session during a demo.
             with tempfile.TemporaryDirectory(prefix="demo-", dir=paths.tmp) as folder:
                 demo_paths = replace(AppPaths.for_root(Path(folder)), browsers=paths.browsers).prepare()
-                settings = replace(settings, auto_submit=True, max_chapters=2)
+                settings = replace(settings, auto_submit=True, max_chapters=4)
                 stop = threading.Event()
                 browser = BrowserSession(settings, demo_paths, print, stop)
                 try:
                     browser.launch(url, headless=True)
                     count = Workflow(browser, DemoSolver(browser, url), settings, stop, print, print).run()
-                    if count != 2:
-                        raise RuntimeError(f"演示应完成 2 节，实际完成 {count} 节。")
+                    if count != 4:
+                        raise RuntimeError(f"演示应完成 4 个学习页面，实际完成 {count} 个。")
                     print("本地演示完成：视频 → 检测 → 文档 → 检测。")
                     return 0
                 finally:

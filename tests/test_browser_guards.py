@@ -142,8 +142,11 @@ class BrowserReadinessTests(unittest.TestCase):
         self.assertTrue(self.session._is_chapter_page(ReadyPage([outer, child])))
 
     def test_visible_chapter_controls_do_not_require_known_url(self):
-        self.assertTrue(self.session._is_chapter_page(ReadyPage([ReadyFrame(quiz=True)])))
+        self.assertTrue(self.session._is_chapter_page(ReadyPage([ReadyFrame(selectors=(".TiMu",))])))
         self.assertTrue(self.session._is_chapter_page(ReadyPage([ReadyFrame(selectors=(".chapter-content",))])))
+
+    def test_activity_tab_caption_alone_does_not_identify_a_learning_page(self):
+        self.assertFalse(self.session._is_chapter_page(ReadyPage([ReadyFrame(quiz=True)])))
 
     def test_homepage_media_and_generic_iframe_are_not_chapter_controls(self):
         self.assertFalse(self.session._is_chapter_page(ReadyPage([ReadyFrame(selectors=("video", "#iframe"))])))
