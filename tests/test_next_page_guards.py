@@ -22,6 +22,7 @@ class NextPageGuardTests(unittest.TestCase):
         self.patches = [
             patch.object(self.session, '_guard'),
             patch.object(self.session, '_text_control', return_value=self.button),
+            patch.object(self.session, '_next_warning', return_value=None),
             patch.object(self.session, '_click'),
             patch.object(self.session, 'poll_ready', return_value=True),
             patch.object(self.session, 'chapter_kind', return_value='document'),

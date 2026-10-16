@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>未完成任务点的下一节提示 · 本地回归</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:18px sans-serif;color:#222;background:white}main{max-width:900px;margin:30px auto}.document-viewer{height:320px;overflow:auto;border:1px solid #aaa;padding:15px}.document-page{min-height:850px;padding:15px}.footer{display:flex;justify-content:flex-end;margin-top:25px}button,a{cursor:pointer}button{padding:12px 25px;font:inherit}
+.warning-layer{position:fixed;inset:0;background:#0008;display:grid;place-items:center;z-index:20}.popDiv,.custom-warning-card{width:440px;background:white;padding:24px;box-shadow:0 10px 40px #3337}.custom-warning-card{position:fixed;left:calc(50% - 220px);top:calc(50% - 110px)}.popWord2{line-height:1.8}.dialog-actions{display:flex;justify-content:flex-end;gap:15px}.dialog-actions a{display:inline-block;padding:10px 20px;border:1px solid #ccd5df;color:#2869b5;text-decoration:none}.pop-close{float:right;border:0;background:white;padding:0 5px;font-size:24px}.disabled{opacity:.4;pointer-events:none}iframe.modal-frame{position:fixed;inset:0;width:100%;height:100%;border:0;z-index:20;background:transparent}
+.video-js{position:relative;width:640px;height:360px;background:black}.vjs-tech{width:640px;height:360px}.vjs-big-play-button{position:absolute;left:260px;top:145px}
+[hidden]{display:none!important}
+</style></head><body><div id="app"></div>
+<script>
+const warningParams=new URLSearchParams(location.search),warningAssetURL=new URL('next_warning.html',location.href).href;
+const warningStore='next-warning-metrics';
+function warningMetrics(){return JSON.parse(localStorage.getItem(warningStore)||'{}');}
+function warningUpdate(values){localStorage.setItem(warningStore,JSON.stringify({...warningMetrics(),...values}));}
+function warningMarkup(){
+  const classes=warningParams.get('unknown')==='1'?'custom-warning-card':'popDiv wid440 popMove';
+  const text=warningParams.get('unrelated')==='1'?'是否清除当前浏览器的历史记录？':'当前章节还有任务点未完成，是否去完成？';
+  return `<div class="warning-layer" hidden><div class="${classes}"><button class="pop-close" aria-label="关闭">×</button><p class="popWord2 fs16 colorIn jobLimitTip">${text}</p><div class="dialog-actions"><a href="javascript:void(0)" class="btnBlue btn_92_cancel fr fs14 popMoveDele">去学习</a><a href="javascript:void(0)" class="jb_btn jb_btn_92 fr fs14 nextChapter">下一节</a></div></div></div>`;
+}
+function mountWarning(host){
+  host.insertAdjacentHTML('beforeend',warningMarkup());
+  const layer=host.querySelector('.warning-layer');
+  const next=layer.querySelector('.nextChapter');
+  if(warningParams.get('modal_disabled')==='1'){next.classList.add('disabled');next.setAttribute('aria-disabled','true');}
+  next.addEventListener('click',event=>{event.preventDefault();window.top.warningAction('next',event.isTrusted);});
+  layer.querySelector('.popMoveDele').addEventListener('click',event=>{event.preventDefault();window.top.warningAction('study',event.isTrusted);});
+  layer.querySelector('.pop-close').addEventListener('click',event=>window.top.warningAction('close',event.isTrusted));
+  window.showNextWarning=()=>{layer.hidden=false;window.top.warningShown();};
+  window.hideNextWarning=()=>layer.hidden=true;
+  window.warningModalReady=true;
+}
+if(warningParams.get('view')==='modal'){
+  document.body.style.background='transparent';mountWarning(document.getElementById('app'));
+}else{
+  warningUpdate({footerClicks:0,footerTrusted:[],modalNextClicks:0,modalNextTrusted:[],studyClicks:0,closeClicks:0,hiddenClicks:0,shown:0,contentReady:false,playClicks:0});
+  const app=document.getElementById('app');
+  if(warningParams.get('body_reader')==='1')document.body.setAttribute('data-document','');
+  const originalDocument='<article id="activity-copy" class="document-page"><h2>切换前的学习内容</h2><p>这是原始文档内容，提示框打开或关闭都不能把它变成下一学习页面。</p><p style="margin-top:650px">原始文档底部</p></article>';
+  const initialContent=warningParams.get('video')==='1'
+    ?'<div class="video-js"><video id="underlying-video" class="vjs-tech" preload="none" src="lesson.webm" controls></video><button class="vjs-big-play-button" aria-label="播放视频">播放</button></div>'
+    :warningParams.get('body_reader')==='1'?originalDocument:`<div class="document-viewer" data-document-viewer>${originalDocument}</div>`;
+  app.innerHTML=`<main><h1>同一地址的学习页面</h1><div id="jobFinishTip" class="AlertCon02" hidden><p class="jobLimitTip">当前章节还有任务点未完成，是否去完成？</p><a href="javascript:void(0)">去学习</a><a href="javascript:void(0)" class="nextChapter">下一节</a></div><div id="activity-host">${initialContent}</div><nav class="footer"><button id="footer-next">下一节</button></nav></main>`;
+  if(warningParams.get('video')==='1')document.querySelector('.vjs-big-play-button').addEventListener('click',()=>warningUpdate({playClicks:warningMetrics().playClicks+1}));
+  document.getElementById('jobFinishTip').addEventListener('click',()=>warningUpdate({hiddenClicks:warningMetrics().hiddenClicks+1}));
+  const footer=document.getElementById('footer-next');
+  if(warningParams.get('footer_disabled')==='1')footer.disabled=true;
+  let modalFrame=null;
+  window.warningShown=()=>{
+    warningUpdate({shown:warningMetrics().shown+1});
+    if(typeof window.onNextWarningShown==='function')window.onNextWarningShown();
+  };
+  function showWarning(){if(modalFrame){modalFrame.hidden=false;modalFrame.contentWindow.showNextWarning();}else window.showNextWarning();}
+  function hideWarning(){if(modalFrame){modalFrame.contentWindow.hideNextWarning();modalFrame.hidden=true;}else window.hideNextWarning();}
+  window.warningAction=(action,trusted)=>{
+    const current=warningMetrics();
+    if(action==='study'){warningUpdate({studyClicks:current.studyClicks+1});return;}
+    if(action==='close'){warningUpdate({closeClicks:current.closeClicks+1});hideWarning();return;}
+    warningUpdate({modalNextClicks:current.modalNextClicks+1,modalNextTrusted:[...current.modalNextTrusted,trusted]});
+    if(warningParams.get('mode')==='sticky')return;
+    hideWarning();
+    if(warningParams.get('mode')==='hide-only')return;
+    setTimeout(()=>{
+      const nextContent='<h2>已经进入下一学习内容</h2><p>这是确认提示后真正加载的新文档，与原始文档的题目和正文都不同。</p><p style="margin-top:650px">新文档底部</p>';
+      if(document.getElementById('activity-copy'))document.getElementById('activity-copy').innerHTML=nextContent;
+      else document.getElementById('activity-host').innerHTML=`<div class="document-viewer" data-document-viewer><article id="activity-copy" class="document-page">${nextContent}</article></div>`;
+      warningUpdate({contentReady:true});
+    },500);
+  };
+  if(warningParams.get('frame')==='1'){
+    modalFrame=document.createElement('iframe');modalFrame.className='modal-frame';modalFrame.hidden=true;
+    const child=new URL(warningAssetURL);child.search=warningParams.toString();child.searchParams.set('view','modal');
+    modalFrame.src=child.href;app.appendChild(modalFrame);
+    modalFrame.addEventListener('load',()=>{if(warningParams.get('preopen')==='1'){footer.disabled=true;showWarning();}});
+  }else{
+    mountWarning(app);
+    if(warningParams.get('preopen')==='1'){footer.disabled=true;showWarning();}
+  }
+  footer.addEventListener('click',event=>{
+    const current=warningMetrics();warningUpdate({footerClicks:current.footerClicks+1,footerTrusted:[...current.footerTrusted,event.isTrusted]});
+    footer.disabled=true;setTimeout(showWarning,Number(warningParams.get('delay')||0));
+  });
+  window.nextWarningFixtureReady=()=>{
+    const ready=modalFrame?modalFrame.contentWindow.warningModalReady:window.warningModalReady;
+    return !!ready&&(warningParams.get('preopen')!=='1'||warningMetrics().shown>0);
+  };
+}
+</script></body></html>

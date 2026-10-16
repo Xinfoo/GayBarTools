@@ -85,6 +85,7 @@
 | --- | --- |
 | [test_browser_integration.py](../tests/test_browser_integration.py) | 视频完整自然播放、没有 seek、倍速为 1；选项、提交、网页内确认与下一节的输入事件；两章完整流程 |
 | [test_next_page_integration.py](../tests/test_next_page_integration.py) | 无检测页签、同 URL 视图切换、内容页连续出现、已提交检测跳过重复作答及隐藏旧内容过滤 |
+| [test_next_warning_integration.py](../tests/test_next_warning_integration.py) | 未完成任务点提示框内下一节的真实点击、隐藏模板过滤、一次确认，以及弹层关闭后仍等待新内容 |
 | [test_retained_video_quiz_integration.py](../tests/test_retained_video_quiz_integration.py) | 残留或被覆盖播放器不阻挡章节答题、可变页签名称、隐藏原生选项及内部滚动题目的真实输入 |
 | [test_aria_hidden_options_integration.py](../tests/test_aria_hidden_options_integration.py) | 真实 DOM 对应的可见 aria-hidden 选项、单选与多选状态标记、真实鼠标填写及本地提交 |
 | [test_preload_none_video_integration.py](../tests/test_preload_none_video_integration.py) | 未预载及延迟启动视频的单次播放点击、正常播放与自然结束、空播放器不提前放行 |

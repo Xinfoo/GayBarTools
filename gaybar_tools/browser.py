@@ -55,6 +55,9 @@ _QUESTION_TITLES = ".Zy_TItle, .question-title, .questionTitle, .stem, legend, .
 _OPTION_SELECTORS = (".Zy_ulTop > li", ".answerList > li", ".answer-list > li",
                      ".options > li", ".option", "[role=radio]", "[role=checkbox]", "label")
 _NEXT = re.compile(r"^下[一1]节(?:\s*[>›»])?$")
+_NEXT_TASK_WARNING = re.compile(r"当前章节.{0,16}任务点.{0,8}未完成[，,。\s]*是否.{0,8}完成")
+_NEXT_WARNING_ROOTS = ("dialog, [role=dialog], .popDiv, .AlertCon02, .layui-layer, "
+                       ".ant-modal, .el-message-box, .confirm-dialog")
 _SUBMIT = re.compile(r"^(?:提交|提交答案|提交作业|交卷)$")
 _RESULT = re.compile(r"(?:提交成功|已提交|作业已完成|测验已完成|我的答案\s*[:：]|本次得分|本次成绩|最终成绩)")
 _SUBMITTED_RESULT = re.compile(r"提交成功|已提交|作业已完成|测验已完成")
@@ -598,7 +601,7 @@ class BrowserSession:
         signature, _ready = self._view_signature(kind)
         return f"{self._chapter_identifier()}|{kind}|{signature}"
 
-    def _view_signature(self, kind: str) -> tuple[str, bool]:
+    def _view_signature(self, kind: str, *, include_occluded: bool = False) -> tuple[str, bool]:
         """Describe the actual content, excluding outer navigation and status.
 
         Only semantic content changes count as a new activity. Updating the
@@ -611,7 +614,8 @@ class BrowserSession:
             # The page identity describes all of its content even when its
             # first recognised kind is video. Use structural order for this
             # stable signature, rather than viewport/scroll coordinates.
-            tasks = sorted(self.content_tasks(), key=lambda task: tuple(segment[2] for segment in task.order))
+            content = self.content_tasks(include_occluded=True) if include_occluded else self.content_tasks()
+            tasks = sorted(content, key=lambda task: tuple(segment[2] for segment in task.order))
             for task in tasks:
                 if task.kind == "video":
                     state = task.target.evaluate("""e => ({
@@ -673,9 +677,27 @@ class BrowserSession:
 
     @staticmethod
     def _document_semantic(target: Any) -> dict[str, Any]:
-        return target.evaluate("""e => {
+        return target.evaluate("""(e, {warningPattern, dialogs}) => {
                     const chrome='button, input, select, textarea, script, style, nav, [role=status], '
-                        + '[role=progressbar], .status, .progress, .toolbar, .reader-toolbar';
+                        + '[role=progressbar], .status, .progress, .toolbar, .reader-toolbar, ' + dialogs;
+                    const warning=new RegExp(warningPattern), warnings=[];
+                    const text=n=>(n.innerText || n.textContent || '').replace(/\\s+/g,' ').trim();
+                    const actions='button,a,[role=button],input[type=button],input[type=submit],li,span,div';
+                    // Match the same minimal floating prompt in custom skins.
+                    // Its appearance/disappearance is chrome, not new reading.
+                    for(const go of e.querySelectorAll(actions)){
+                        if(text(go)!=='去学习')continue;
+                        for(let p=go.parentElement;p && e.contains(p) && !p.matches('body,html');p=p.parentElement){
+                            if(!warning.test(text(p)))continue;
+                            if(![...p.querySelectorAll(actions)].some(n=>/^下[一1]节(?:\\s*[>›»])?$/.test(text(n))))continue;
+                            let floating=false;
+                            for(let n=p;n && !n.matches('body,html');n=n.parentElement){
+                                if(['fixed','absolute'].includes(getComputedStyle(n).position)){floating=true;break;}
+                            }
+                            if(floating){warnings.push(p);break;}
+                        }
+                    }
+                    const excluded=n=>n.closest(chrome) || warnings.some(root=>root.contains(n));
                     const visible=n=>{
                         for(let p=n;p;p=p.parentElement){
                             const s=getComputedStyle(p);
@@ -684,19 +706,19 @@ class BrowserSession:
                         }
                         return true;
                     };
-                    const text=[],walker=document.createTreeWalker(e,NodeFilter.SHOW_TEXT);
+                    const texts=[],walker=document.createTreeWalker(e,NodeFilter.SHOW_TEXT);
                     for(let n=walker.nextNode();n;n=walker.nextNode()){
-                        if(n.parentElement && !n.parentElement.closest(chrome) && visible(n.parentElement))text.push(n.textContent);
+                        if(n.parentElement && !excluded(n.parentElement) && visible(n.parentElement))texts.push(n.textContent);
                     }
                     return {
-                        text:text.join(' ').replace(/\\s+/g,' ').trim(),
-                        media:[...e.querySelectorAll('img, canvas, svg')].filter(n=>visible(n) && !n.closest(chrome)).map(n=>[
+                        text:texts.join(' ').replace(/\\s+/g,' ').trim(),
+                        media:[...e.querySelectorAll('img, canvas, svg')].filter(n=>visible(n) && !excluded(n)).map(n=>[
                             n.tagName, n.getAttribute('src') || '', n.getAttribute('aria-label') || '',
                             n.getAttribute('width') || '', n.getAttribute('height') || ''])
                     };
-                }""")
+                }""", {"warningPattern": _NEXT_TASK_WARNING.pattern, "dialogs": _NEXT_WARNING_ROOTS})
 
-    def _content_document_tokens(self, kind: str) -> tuple[Any, ...]:
+    def _content_document_tokens(self, kind: str, *, include_occluded: bool = False) -> tuple[Any, ...]:
         """Navigation evidence when two chapters reuse identical material.
 
         This is deliberately absent from chapter_key: returning to an already
@@ -704,7 +726,8 @@ class BrowserSession:
         """
         tokens = []
         if kind in {"video", "document"}:
-            roots = self._video_locators() + self._document_targets()
+            videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
+            roots = videos + self._document_targets()
         elif kind == "quiz":
             roots = []
             for frame in self._frames():
@@ -724,14 +747,13 @@ class BrowserSession:
                     # Blob URLs are ephemeral and excluded from the stable
                     # visited key. Their replacement is useful navigation
                     # evidence for SPA players that keep the same document.
-                    resource = (root.evaluate("e => e.currentSrc || e.getAttribute('src') || ''")
-                                if kind == "video" else "")
+                    resource = root.evaluate("e => e.tagName==='VIDEO' ? (e.currentSrc || e.getAttribute('src') || '') : ''")
                     tokens.append((id(frame), frame.evaluate("performance.timeOrigin"), resource))
             finally:
                 handle.dispose()
         return tuple(sorted(set(tokens)))
 
-    def _video_locators(self) -> list[Any]:
+    def _video_locators(self, *, include_occluded: bool = False) -> list[Any]:
         result = []
         for frame in self._frames():
             try:
@@ -740,7 +762,9 @@ class BrowserSession:
                 videos = frame.locator("video")
                 for index in range(videos.count()):
                     video = videos.nth(index)
-                    if self._video_visible(video, player=True):
+                    visible = (self._video_visible(video, player=True, include_occluded=True)
+                               if include_occluded else self._video_visible(video, player=True))
+                    if visible:
                         result.append(video)
             except Exception:
                 continue
@@ -830,11 +854,12 @@ class BrowserSession:
         finally:
             handle.dispose()
 
-    def content_tasks(self) -> list[ContentTask]:
+    def content_tasks(self, *, include_occluded: bool = False) -> list[ContentTask]:
         """Discover every mounted document/player, in visible page order."""
         self._guard()
         tasks = []
-        for kind, targets in (("video", self._video_locators()),
+        videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
+        for kind, targets in (("video", videos),
                               ("document", self._document_targets())):
             for target in targets:
                 identity = self._content_identity(target, kind)
@@ -1044,7 +1069,7 @@ class BrowserSession:
             raise BrowserError("无法确定视频所在页面。")
         return frame
 
-    def _video_visible(self, locator: Any, *, player: bool = False) -> bool:
+    def _video_visible(self, locator: Any, *, player: bool = False, include_occluded: bool = False) -> bool:
         """Exclude retired player regions without hiding below-fold quiz rows."""
         self._check_stop()
         visible_ancestors = """e => {
@@ -1074,7 +1099,7 @@ class BrowserSession:
             }
             return right>left && bottom>top;
         }"""
-        exposed_player = """e => {
+        exposed_player = """(e, includeOccluded) => {
             const r=e.getBoundingClientRect();
             const left=Math.max(0,r.left),right=Math.min(innerWidth,r.right);
             const top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);
@@ -1088,6 +1113,7 @@ class BrowserSession:
                 // from the document's origin. Already scrolled content can.
                 return r.right+revealX>0 && r.bottom+revealY>0;
             }
+            if(includeOccluded)return true;
             let owner=e.closest('.video-js, .video-stage, .ans-video, .ans-video-player, '
                 + '.video-container, .video-player, .player-container, [data-video-player]');
             if(!owner && e.tagName==='VIDEO' && e.parentElement
@@ -1106,8 +1132,10 @@ class BrowserSession:
         try:
             if not self._visible(locator) or not locator.evaluate(visible_ancestors):
                 return False
-            if player and not locator.evaluate(exposed_player):
-                return False
+            if player:
+                exposed = locator.evaluate(exposed_player, True) if include_occluded else locator.evaluate(exposed_player)
+                if not exposed:
+                    return False
             handle = locator.element_handle(timeout=1000)
             if handle is None:
                 return False
@@ -1122,8 +1150,10 @@ class BrowserSession:
                 try:
                     if not self._visible(element) or not element.evaluate(visible_ancestors):
                         return False
-                    if player and not element.evaluate(exposed_player):
-                        return False
+                    if player:
+                        exposed = element.evaluate(exposed_player, True) if include_occluded else element.evaluate(exposed_player)
+                        if not exposed:
+                            return False
                 finally:
                     element.dispose()
                 frame = frame.parent_frame
@@ -2025,30 +2055,115 @@ class BrowserSession:
         except Exception:
             return False
 
+    def _next_warning(self) -> Any | None:
+        """Find the next-section control inside the known unfinished-task prompt."""
+        def control(container: Any) -> Any | None:
+            if not self._visible(container):
+                return None
+            text = _clean(container.inner_text(timeout=1000))
+            if not _NEXT_TASK_WARNING.search(text):
+                return None
+            if self._text_control(re.compile(r"^去学习$"), root=container) is None:
+                return None
+            return self._text_control(_NEXT, root=container)
+
+        def find(frame: Any) -> Any | None:
+            dialogs = frame.locator(_NEXT_WARNING_ROOTS)
+            for index in range(min(dialogs.count(), 30)):
+                target = control(dialogs.nth(index))
+                if target is not None:
+                    return target
+            # Some skins have no dialog role or familiar class. Start at the
+            # prompt and find its nearest floating container with both actions;
+            # never fall back to searching the whole page's footer.
+            prompts = frame.get_by_text(_NEXT_TASK_WARNING)
+            for index in range(min(prompts.count(), 15)):
+                container = prompts.nth(index)
+                for _depth in range(8):
+                    tag = container.evaluate("e => e.tagName")
+                    if tag in {"HTML", "BODY"}:
+                        break
+                    floating = container.evaluate("""e => {
+                        for(let n=e;n && !n.matches('body,html');n=n.parentElement){
+                            if(['fixed','absolute'].includes(getComputedStyle(n).position))return true;
+                        }
+                        return false;
+                    }""")
+                    if floating:
+                        target = control(container)
+                        if target is not None:
+                            return target
+                    container = container.locator("xpath=..")
+            return None
+
+        for frame in self._frames():
+            if not self._frame_visible(frame):
+                continue
+            try:
+                target = find(frame)
+                if target is not None:
+                    return target
+            except StopRequested:
+                raise
+            except Exception:
+                # Navigation may replace the frame while inspecting its layer.
+                continue
+        return None
+
     def next_chapter(self) -> bool:
         self._guard()
+        warning = self._next_warning()
+        include_occluded = warning is not None
         previous_kind = self.chapter_kind()
-        previous, _previous_ready = self._view_signature(previous_kind)
+        # A warning already open at entry can cover the old player. Snapshot
+        # its real material as well, so merely closing the layer cannot look
+        # like navigation to a newly visible video.
+        if include_occluded and previous_kind != "quiz" and self._video_locators(include_occluded=True):
+            previous_kind = "video"
+        previous, _previous_ready = (self._view_signature(previous_kind, include_occluded=True)
+                                     if include_occluded else self._view_signature(previous_kind))
         previous_chapter = self._chapter_identifier()
-        previous_documents = self._content_document_tokens(previous_kind)
+        previous_documents = (self._content_document_tokens(previous_kind, include_occluded=True)
+                              if include_occluded else self._content_document_tokens(previous_kind))
         previous_url = self.current_url
-        button = self._text_control(_NEXT)
+        button = warning if warning is not None else self._text_control(_NEXT)
         if button is None:
             return False
         if button.get_attribute("aria-disabled") == "true" or button.get_attribute("disabled") is not None:
+            if warning is not None:
+                raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
             return False
         if re.search(r"(?:^|\s)(?:disabled|disable)(?:\s|$)", button.get_attribute("class") or ""):
+            if warning is not None:
+                raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
             return False
+        if warning is not None:
+            self.log("检测到未完成任务点提示，点击提示框内的下一节。")
         self._click(button)
+        warning_confirmed = warning is not None
         deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
         candidate, candidate_since = None, 0.0
         departed_since = 0.0
+        kind, content_ready = previous_kind, _previous_ready
         while time.monotonic() < deadline:
             self._guard()
+            warning = self._next_warning()
+            if warning is not None:
+                candidate, candidate_since, departed_since = None, 0.0, 0.0
+                if not warning_confirmed:
+                    if re.search(r"(?:^|\s)(?:disabled|disable)(?:\s|$)", warning.get_attribute("class") or ""):
+                        raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
+                    self.log("检测到未完成任务点提示，点击提示框内的下一节。")
+                    self._click(warning)
+                    warning_confirmed = True
+                    deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
+                self._wait(0.25)
+                continue
             ready = self.poll_ready()
             kind = self.chapter_kind()
             try:
-                signature, content_ready = self._view_signature(kind)
+                signature, content_ready = (self._view_signature(kind, include_occluded=True)
+                                           if include_occluded else self._view_signature(kind))
             except (BrowserError, StopRequested):
                 raise
             except Exception:
@@ -2057,9 +2172,13 @@ class BrowserSession:
             # tab. Explicit content recognition is sufficient after the click.
             chapter = self._chapter_identifier()
             changed = kind != previous_kind or signature != previous
+            if include_occluded and kind in {"video", "document"} and previous_kind in {"video", "document"}:
+                changed = signature != previous
             if (content_ready and not changed and chapter != previous_chapter
                     and previous_documents):
-                changed = self._content_document_tokens(kind) != previous_documents
+                documents = (self._content_document_tokens(kind, include_occluded=True)
+                             if include_occluded else self._content_document_tokens(kind))
+                changed = documents != previous_documents
             if content_ready and signature and changed:
                 current = (kind, signature)
                 if current != candidate:
