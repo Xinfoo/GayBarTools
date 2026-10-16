@@ -3,10 +3,13 @@
 <section class="TiMu" id="question-2" data-question-id="question-2"><h3 class="Zy_TItle">2【多选题】遇到可疑链接时，哪些做法是正确的？</h3><ul class="Zy_ulTop"><li><label><input type="checkbox" name="question-2" value="A"><span class="option-label">A</span><span class="option-text">核实信息来源</span></label></li><li><label><input type="checkbox" name="question-2" value="B"><span class="option-label">B</span><span class="option-text">向可靠渠道报告</span></label></li><li><label><input type="checkbox" name="question-2" value="C"><span class="option-label">C</span><span class="option-text">不加核实地传播</span></label></li></ul></section>
 <section class="TiMu" id="question-3" data-question-id="question-3"><h3 class="Zy_TItle">3【判断题】阅读文档时应该看完全部内容。</h3><ul class="Zy_ulTop"><li><label><input type="radio" name="question-3" value="A"><span class="option-label">A</span><span class="option-text">对</span></label></li><li><label><input type="radio" name="question-3" value="B"><span class="option-label">B</span><span class="option-text">错</span></label></li></ul></section>
 <div class="quiz-buttons"><button type="button" id="save-draft">暂时保存</button><button type="button" id="submit-quiz" class="primary" data-testid="submit-quiz">提交</button></div></form><div id="submission-result" role="status"></div>
-<div id="confirm-layer" class="layui-layer-shade" hidden><section class="layui-layer layui-layer-dialog" role="dialog" aria-modal="true" aria-label="提交确认"><div class="dialog-title">提示</div><p class="dialog-message">确认提交？</p><div class="dialog-buttons"><button type="button" id="cancel-submit">取消</button><button type="button" class="layui-layer-btn0 primary" id="confirm-submit" aria-label="确认提交" data-testid="confirm-submit">提交</button></div></section></div>
+<div id="confirm-layer" class="layui-layer-shade" hidden><section class="layui-layer layui-layer-dialog" role="dialog" aria-modal="true" aria-label="提交确认"><div class="dialog-title">提示</div><p class="dialog-message">确认提交？</p><div class="dialog-buttons"><button type="button" id="cancel-submit">取消</button><button type="button" class="layui-layer-btn0 primary" id="confirm-submit" aria-label="确认提交" data-testid="confirm-submit">提交</button></div></section></div><nav class="chapter-nav"><button id="next-chapter" hidden disabled>下一节</button></nav>
 <script>
 const form=document.getElementById('quiz-form');
 const confirmLayer=document.getElementById('confirm-layer');
+const next=document.getElementById('next-chapter');
+if(new URLSearchParams(location.search).get('next')==='complete')next.hidden=false;
+next.addEventListener('click',event=>{recordDemo('navigation',{quizNextTrusted:event.isTrusted});location.href='complete.html';});
 let inputClicks=0,submitClicks=0,confirmClicks=0;
 form.addEventListener('click',event=>{if(event.target.matches('input'))recordDemo('quiz',{inputClicks:++inputClicks,lastInputTrusted:event.isTrusted});});
 document.getElementById('save-draft').addEventListener('click',()=>document.getElementById('submission-result').textContent='已暂时保存');
@@ -27,6 +30,7 @@ document.getElementById('confirm-submit').addEventListener('click',event=>{
   form.hidden=true;
   document.getElementById('submission-result').className='submit-success';
   document.getElementById('submission-result').textContent=`提交成功 · 已完成本节学习检测。本次成绩 ${correct?'100':'0'} 分。`;
+  next.disabled=false;
   signalDemo('quiz-complete');
 });
 </script></body></html>

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>已提交测验到懒加载视频 · 本地回归</title>
+<link rel="stylesheet" href="style.css"><style>
+main{max-width:1000px;margin:auto}#content-frame{height:450px}.video-js{position:relative;width:640px;height:360px;background:black}
+.vjs-tech{width:640px;height:360px}.vjs-big-play-button{position:absolute;top:145px;left:260px}
+</style></head><body><div id="app"></div>
+<script>
+const params=new URLSearchParams(location.search),storageKey='preload-none-video-metrics';
+function metrics(){return JSON.parse(localStorage.getItem(storageKey)||'{}');}
+function update(values){localStorage.setItem(storageKey,JSON.stringify({...metrics(),...values}));}
+const app=document.getElementById('app');
+if(params.get('view')==='player'){
+  document.body.className='activity-body';
+  const source=params.get('empty')==='1'?'':' src="lesson.webm"';
+  app.innerHTML=`<div class="video-js"><video id="video_html5_api" class="vjs-tech" preload="none" controls${source}></video><button class="vjs-big-play-button" aria-label="播放视频">播放</button></div>`;
+  const video=document.querySelector('video'),play=document.querySelector('.vjs-big-play-button');
+  let startedAt=0,clickedAt=0;
+  play.addEventListener('click',event=>{
+    clickedAt=performance.now();update({playClicks:(metrics().playClicks||0)+1,playTrusted:event.isTrusted});
+    const delay=Number(params.get('delay')||0);
+    if(delay>0)setTimeout(()=>video.play(),delay);else video.play();
+  });
+  video.addEventListener('play',()=>{play.hidden=true;if(!startedAt){startedAt=performance.now();update({playStartDelay:(startedAt-clickedAt)/1000});}});
+  video.addEventListener('seeking',()=>update({seekEvents:(metrics().seekEvents||0)+1}));
+  video.addEventListener('ratechange',()=>update({playbackRate:video.playbackRate}));
+  video.addEventListener('ended',()=>{
+    update({ended:true,duration:video.duration,currentTime:video.currentTime,elapsed:(performance.now()-startedAt)/1000,playbackRate:video.playbackRate});
+    parent.postMessage({source:'preload-none-local-video',type:'ended'},location.origin);
+  });
+}else{
+  update({playClicks:0,nextTrusted:[],seekEvents:0,playbackRate:1,ended:false});
+  app.innerHTML='<main><h1>测验完成后的下一学习活动</h1><section id="submitted-result"><div class="submit-success">提交成功 · 已完成本节测验</div></section><iframe id="content-frame" title="下一节视频播放器" hidden></iframe><nav class="chapter-nav"><button id="next-chapter">下一节</button></nav></main>';
+  const frame=document.getElementById('content-frame'),next=document.getElementById('next-chapter');
+  let atVideo=false;
+  next.addEventListener('click',event=>{
+    update({nextTrusted:[...metrics().nextTrusted,event.isTrusted]});
+    if(atVideo){location.href='complete.html';return;}
+    atVideo=true;document.getElementById('submitted-result').hidden=true;frame.hidden=false;next.disabled=true;
+    frame.src=`preload_none_video.html?view=player&chapterId=local-preload&courseId=local&empty=${params.get('empty')==='1'?'1':'0'}&delay=${Number(params.get('delay')||0)}`;
+  });
+  addEventListener('message',event=>{
+    if(event.origin===location.origin&&event.data?.source==='preload-none-local-video'&&event.data.type==='ended')next.disabled=false;
+  });
+}
+</script></body></html>

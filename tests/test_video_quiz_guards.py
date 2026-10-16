@@ -166,6 +166,61 @@ class VideoQuizGuardTests(unittest.TestCase):
         self.assertGreaterEqual(click_times[0] - 100, self.browser.PAUSED_QUIZ_GRACE)
         self.browser._click.assert_called_once_with(play)
 
+    def test_play_request_that_never_starts_times_out_without_repeated_clicks(self):
+        clock, click_times = [100.0], []
+        video, frame, play, callback = Mock(), Mock(), Mock(), Mock()
+        video.evaluate.side_effect = lambda _script: media_state(paused=True)
+        self.browser._video_locators = Mock(return_value=[video])
+        self.browser._find_video_quiz = Mock(return_value=None)
+        self.browser._handle_video_quiz = Mock()
+        self.browser._video_frame = Mock(return_value=frame)
+        frame.locator.return_value.count.return_value = 1
+        self.browser._visible = Mock(return_value=True)
+        self.browser._first_visible = Mock(return_value=play)
+        self.browser._click = Mock(side_effect=lambda _target: click_times.append(clock[0]))
+        self.browser._wait = Mock(side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+        with patch("gaybar_tools.browser.time.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(BrowserError, "点击播放后视频仍未开始"):
+                self.browser._watch_video(on_quiz=callback)
+
+        self.browser._click.assert_called_once_with(play)
+        self.assertGreaterEqual(clock[0] - click_times[0], self.browser.VIDEO_START_TIMEOUT)
+        self.assertLess(clock[0] - 100, self.browser.settings.video_timeout)
+        self.browser._handle_video_quiz.assert_not_called()
+        callback.assert_not_called()
+
+    def test_stop_while_waiting_for_play_start_prevents_further_actions(self):
+        clock, click_times = [100.0], []
+        video, frame, play, callback = Mock(), Mock(), Mock(), Mock()
+        video.evaluate.side_effect = lambda _script: media_state(paused=True)
+        self.browser._video_locators = Mock(return_value=[video])
+        self.browser._find_video_quiz = Mock(return_value=None)
+        self.browser._handle_video_quiz = Mock()
+        self.browser._video_frame = Mock(return_value=frame)
+        frame.locator.return_value.count.return_value = 1
+        self.browser._visible = Mock(return_value=True)
+        self.browser._first_visible = Mock(return_value=play)
+        self.browser._click = Mock(side_effect=lambda _target: click_times.append(clock[0]))
+
+        def wait(seconds):
+            self.browser._check_stop()
+            clock[0] += seconds
+            if click_times and clock[0] - click_times[0] >= 2:
+                self.stop.set()
+            self.browser._check_stop()
+
+        self.browser._wait = Mock(side_effect=wait)
+        with patch("gaybar_tools.browser.time.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(StopRequested):
+                self.browser._watch_video(on_quiz=callback)
+
+        self.assertTrue(self.stop.is_set())
+        self.browser._click.assert_called_once_with(play)
+        self.assertLess(clock[0] - click_times[0], self.browser.VIDEO_START_TIMEOUT)
+        self.browser._handle_video_quiz.assert_not_called()
+        callback.assert_not_called()
+
     def test_question_at_media_end_still_submits_and_continues(self):
         root, video, submit, continuation = Mock(), Mock(), Mock(), Mock()
         stage = [0]

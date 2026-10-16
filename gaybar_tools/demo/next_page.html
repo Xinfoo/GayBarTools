@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>同地址连续学习页面 · 本地回归</title>
+<link rel="stylesheet" href="style.css">
+<style>main{max-width:1000px;margin:auto}.document-viewer{height:330px}.document-page{min-height:1050px}.preloaded{position:absolute;inset:0;opacity:0;pointer-events:none;z-index:-1}</style>
+</head><body><main><h1 id="page-title"></h1>
+<div class="preloaded"><video src="lesson.webm" controls></video><iframe title="预加载的旧视频" src="video.html?chapterId=old-hidden-video"></iframe><section class="TiMu" data-question-id="hidden-old-question"><h3 class="Zy_TItle">【单选题】隐藏旧题不可回答。</h3><label><input type="radio" name="old" value="A">A. 旧选项</label><label><input type="radio" name="old" value="B">B. 旧选项</label></section><div class="submit-success">提交成功</div></div>
+<section id="document-panel"><div class="document-toolbar">连续文档内容</div><div class="document-viewer" data-document-viewer tabindex="0"><article class="document-page"><h2 id="document-title"></h2><p id="document-text"></p><p style="margin-top:700px">最后一页，请继续通过右下角下一节。</p></article></div></section>
+<section id="quiz-panel" hidden><form id="quiz-form"><section class="TiMu" data-question-id="sequence-question"><h3 class="Zy_TItle">【单选题】完成连续文档后，应使用什么方式继续？</h3><ul class="Zy_ulTop"><li><label><input type="radio" name="sequence-question" value="A"><span>A. 重复寻找固定的检测标签</span></label></li><li><label><input type="radio" name="sequence-question" value="B"><span>B. 点击下一节并识别新页面类型</span></label></li></ul></section><button type="button" id="submit-quiz">提交</button></form><div id="submission-result" role="status"></div></section>
+<p id="read-status" role="status"></p><nav class="chapter-nav"><button id="next-chapter" disabled>下一节</button></nav></main>
+<script>
+const params=new URLSearchParams(location.search),start=params.get('start')||'document';
+let step=start==='document'?0:2;
+const metrics={documents:{},nextClicks:0,nextTrusted:[],submitClicks:0,submitTrusted:[],hiddenClicks:0};
+const viewer=document.querySelector('.document-viewer'),form=document.getElementById('quiz-form'),next=document.getElementById('next-chapter');
+function persist(){localStorage.setItem('next-page-metrics',JSON.stringify(metrics));}
+document.querySelector('.preloaded').addEventListener('click',()=>{metrics.hiddenClicks++;persist();});
+function render(){
+  document.getElementById('document-panel').hidden=step>=2;
+  document.getElementById('quiz-panel').hidden=step<2;
+  document.getElementById('read-status').textContent='';
+  next.disabled=step<2||start!=='submitted';
+  if(step<2){
+    document.getElementById('page-title').textContent=`文档学习页面 ${step+1}`;
+    document.getElementById('document-title').textContent=step===0?'个人信息保护':'可疑链接辨别';
+    document.getElementById('document-text').textContent=step===0?'第一份文档没有紧跟检测，完成后应继续阅读第二份文档。':'第二份文档结束后，下一节才会出现学习检测。';
+    viewer.scrollTop=0;
+    metrics.documents[step]={atBottom:false,scrollEvents:0};
+  }else{
+    document.getElementById('page-title').textContent='连续阅读后的学习检测';
+    if(start==='submitted'){
+      form.hidden=true;
+      document.getElementById('submission-result').className='submit-success';
+      document.getElementById('submission-result').textContent='提交成功 · 已完成本节学习检测';
+      metrics.alreadySubmitted=true;
+    }
+  }
+  persist();
+}
+viewer.addEventListener('scroll',()=>{
+  if(step>=2)return;
+  const current=metrics.documents[step];
+  current.scrollEvents++;
+  current.atBottom=viewer.scrollTop+viewer.clientHeight>=viewer.scrollHeight-3;
+  if(current.atBottom){next.disabled=false;document.getElementById('read-status').textContent='文档已阅读完成';}
+  persist();
+});
+form.addEventListener('click',event=>{if(event.target.matches('input')){metrics.inputTrusted=event.isTrusted;metrics.answer=event.target.value;persist();}});
+document.getElementById('submit-quiz').addEventListener('click',event=>{
+  metrics.submitClicks++;metrics.submitTrusted.push(event.isTrusted);
+  if(!form.querySelector('input:checked')){persist();return;}
+  metrics.submitted=true;form.hidden=true;
+  document.getElementById('submission-result').className='submit-success';
+  document.getElementById('submission-result').textContent='提交成功 · 已完成本节学习检测';
+  next.disabled=false;persist();
+});
+next.addEventListener('click',event=>{
+  metrics.nextClicks++;metrics.nextTrusted.push(event.isTrusted);persist();
+  if(step>=2){location.href='complete.html';return;}
+  next.disabled=true;
+  document.getElementById('read-status').textContent='正在加载下一节';
+  // The previous view remains present for a while. A click or changed status
+  // alone must not be mistaken for newly loaded course content.
+  setTimeout(()=>{step++;render();},750);
+});
+render();
+</script></body></html>

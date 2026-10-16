@@ -120,7 +120,7 @@ class VideoQuizIntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}):
             completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
 
-        self.assertEqual(completed, 1)
+        self.assertEqual(completed, 2)
         self.assertEqual(len(requests), 4, "首次格式失败、重试成功、第二道视频题和最后学习检测")
         self.assertEqual(requests[0]["messages"][:2], requests[1]["messages"][:2])
         for batch in batches[:3]:
@@ -131,7 +131,7 @@ class VideoQuizIntegrationTests(unittest.TestCase):
         metrics = self.metrics()
         self.assert_real_playback(metrics)
         self.assert_untouched_decoys(metrics)
-        self.assertTrue(metrics["quizTabTrusted"])
+        self.assertTrue(metrics["nextTrusted"])
         self.assertEqual(len(metrics["questions"]), 2)
         first, second = metrics["questions"]
         self.assertEqual((first["inputClicks"], first["submitClicks"], first["continueClicks"]), (1, 1, 1))
@@ -143,6 +143,8 @@ class VideoQuizIntegrationTests(unittest.TestCase):
         chapter_metrics = self.browser.page.evaluate("JSON.parse(localStorage.getItem('gaybar-demo-metrics'))")
         self.assertTrue(chapter_metrics["video-inserts"]["quiz"]["submitted"])
         self.assertTrue(chapter_metrics["video-inserts"]["quiz"]["correct"])
+        self.assertTrue(chapter_metrics["video-inserts"]["navigation"]["quizNextTrusted"])
+        self.assertEqual(self.browser.page.url, f"{self.base_url}/complete.html")
 
     def test_already_selected_answer_still_submits_and_continues(self):
         self.launch("preselected")

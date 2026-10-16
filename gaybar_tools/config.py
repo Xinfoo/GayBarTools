@@ -23,7 +23,7 @@ class AppSettings:
     action_delay_max: float = 1.0
     poll_interval: float = 2.0
     video_timeout: float = 14400.0
-    max_chapters: int = 200
+    max_chapters: int = 200  # Historical settings key; counts learning pages.
     headless: bool = False
     auto_submit: bool = True
     remember_key: bool = False
@@ -51,7 +51,7 @@ class AppSettings:
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"配置 {name} 必须在 {low}～{high} 之间。")
         if not isinstance(self.max_chapters, int):
-            raise ValueError("章节上限必须为整数。")
+            raise ValueError("学习页面上限必须为整数。")
         if self.action_delay_min > self.action_delay_max:
             raise ValueError("最小点击间隔不能大于最大点击间隔。")
         for name in ("vision", "ocr", "headless", "auto_submit", "remember_key"):

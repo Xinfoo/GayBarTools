@@ -3,7 +3,7 @@
 <style>
 body{font:16px sans-serif;margin:20px;background:#fff;color:#222}button,label{cursor:pointer}button{padding:10px 20px}.layout{display:flex;gap:30px}.video-stage{position:relative;width:640px;height:360px;background:#111;flex:none}video{width:100%;height:100%}.vjs-big-play-button{position:absolute;left:260px;top:145px}.ans-videoquiz,.plain-overlay{position:absolute;inset:0;background:rgba(0,0,0,.92);color:white;padding:35px;box-sizing:border-box;z-index:3}.ans-videoquiz[hidden],.vjs-big-play-button[hidden],[hidden]{display:none!important}.Zy_ulTop{list-style:none;padding:0}.Zy_ulTop label{display:block;padding:14px}.quiz-buttons{position:absolute;right:25px;bottom:25px}.notice{padding-top:30px}iframe{width:350px;height:250px;border:1px solid #aaa}
 </style></head><body>
-<h1>本地视频章节</h1><nav><button id="quiz-tab">2 学习检测</button></nav>
+<h1>本地视频章节</h1>
 <div class="layout"><div class="video-stage">
 <video id="lesson-video" controls preload="auto" playsinline src="lesson.webm"></video>
 <button class="vjs-big-play-button" aria-label="播放视频">▶ 播放</button>
@@ -15,6 +15,7 @@ body{font:16px sans-serif;margin:20px;background:#fff;color:#222}button,label{cu
 <section class="TiMu notice" data-question-id="outside-must-not-answer"><h3 class="Zy_TItle">【判断题】播放器之外的学习检测题，绝不可点击。</h3><label><input type="radio" name="outside" value="A">A. 对</label><label><input type="radio" name="outside" value="B">B. 错</label><button id="outside-submit">提交</button></section>
 <section class="TiMu" data-question-id="hidden-must-not-answer" hidden><h3 class="Zy_TItle">【判断题】隐藏的无关题。</h3><label><input type="radio" value="A">A. 对</label><label><input type="radio" value="B">B. 错</label></section>
 <p id="video-status" role="status">等待真实播放</p>
+<nav style="display:flex;justify-content:flex-end"><button id="next-chapter" disabled>下一节</button></nav>
 <script>
 const mode=new URLSearchParams(location.search).get('mode')||'sequence';
 const video=document.getElementById('lesson-video'), popup=document.querySelector('.ans-videoquiz'), play=document.querySelector('.vjs-big-play-button');
@@ -54,8 +55,8 @@ submit.addEventListener('click',event=>{
   current().correct=true;submit.hidden=true;resume.hidden=false;result.textContent='回答正确！请点击继续学习。';persist();
 });
 resume.addEventListener('click',event=>{current().continueClicks++;current().trusted.push(event.isTrusted);finishQuestion();});
-video.addEventListener('ended',()=>{metrics.ended=true;metrics.currentTime=video.currentTime;metrics.elapsed=(performance.now()-startedAt)/1000;document.getElementById('video-status').textContent='视频已自然播放完成';document.querySelector('[data-question-id="outside-must-not-answer"]').hidden=true;document.querySelector('iframe').remove();persist();});
-document.getElementById('quiz-tab').addEventListener('click',event=>{metrics.quizTabTrusted=event.isTrusted;persist();location.href='quiz.html?chapterId=video-inserts&courseId=local';});
+video.addEventListener('ended',()=>{metrics.ended=true;metrics.currentTime=video.currentTime;metrics.elapsed=(performance.now()-startedAt)/1000;document.getElementById('video-status').textContent='视频已自然播放完成';document.querySelector('[data-question-id="outside-must-not-answer"]').hidden=true;document.querySelector('iframe').remove();document.getElementById('next-chapter').disabled=false;persist();});
+document.getElementById('next-chapter').addEventListener('click',event=>{metrics.nextTrusted=event.isTrusted;persist();location.href='quiz.html?chapterId=video-inserts&courseId=local&next=complete';});
 window.mutateActiveQuestion=function(){popup.querySelector('.Zy_TItle').textContent='【判断题】模型请求期间新换上的题目，旧答案不可点击。';};
 persist();
 </script></body></html>

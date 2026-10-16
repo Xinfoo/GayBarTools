@@ -70,10 +70,10 @@ class Application:
         ttk.Label(runtime, text="留空自动查找 Chromium / Edge / Chrome；会话保存在 .runtime。", style="Subtitle.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 10))
         options = ttk.Frame(runtime)
         options.grid(row=2, column=0, columnspan=3, sticky="w")
-        ttk.Label(options, text="章节上限").pack(side="left")
+        ttk.Label(options, text="学习页面上限").pack(side="left")
         self.fields["max_chapters"] = tk.StringVar(value=str(self.settings.max_chapters))
         ttk.Entry(options, textvariable=self.fields["max_chapters"], width=7).pack(side="left", padx=(6, 18))
-        self.check(options, "学习检测自动提交并继续下一节", "auto_submit").pack(side="left")
+        self.check(options, "答题页自动提交并继续下一节", "auto_submit").pack(side="left")
 
         login = ttk.Frame(runtime)
         login.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))

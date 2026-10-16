@@ -1,4 +1,4 @@
-"""Cancelable chapter state machine; the browser stays on its worker thread."""
+"""Process one learning page at a time, following the site's Next control."""
 
 import threading
 from collections.abc import Callable
@@ -36,6 +36,11 @@ class Workflow:
         self.state("视频播放与插入题处理中")
         return answers
 
+    def _content_task_state(self, kind: str, index: int, total: int) -> None:
+        self.check_stop()
+        action = "视频正常播放中（自动处理插入题）" if kind == "video" else "阅读静态页面"
+        self.state(f"任务点 {index}/{total}：{action}")
+
     def run(self) -> int:
         visited: set[str] = set()
         completed = 0
@@ -49,44 +54,40 @@ class Workflow:
                 raise WorkflowError("当前页面未识别到视频、文档或学习检测，请进入课程章节后重试；可查看诊断截图。")
             key = self.browser.chapter_key()
             if not key or key in visited:
-                raise WorkflowError("章节没有变化或发生循环，已停止。")
+                raise WorkflowError("学习页面没有变化或发生循环，已停止。")
             visited.add(key)
-            self.state(f"正在处理第 {completed + 1} 节")
-            if kind == "video":
-                self.state("视频正常播放中（自动处理插入题）")
-                self.browser.watch_video(on_quiz=self._solve_video_quiz)
-            elif kind == "document":
-                self.state("阅读静态页面")
-                self.browser.read_document()
+            self.state(f"正在处理第 {completed + 1} 个学习页面")
+            if kind in {"video", "document"}:
+                self.browser.process_content(on_quiz=self._solve_video_quiz,
+                                             on_task=self._content_task_state)
+            elif kind == "quiz":
+                if self.browser.quiz_completed():
+                    self.log("已识别当前检测的提交结果，继续下一节。")
+                else:
+                    questions = self.browser.get_questions()
+                    if not questions:
+                        raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
+                    self.state(f"识别并解答 {len(questions)} 道题")
+                    screenshot = self.browser.quiz_screenshot() if self.settings.vision or self.settings.ocr else None
+                    answers = self.solver.solve(questions, screenshot)
+                    self.check_stop()
+                    self.browser.apply_answers(answers)
+                    if not self.settings.auto_submit:
+                        self.log("答案已填写；自动提交已关闭，请手动检查并提交。")
+                        self.state("等待手动提交")
+                        return completed
+                    self.state("提交当前答题页")
+                    self.check_stop()
+                    if not self.browser.submit_quiz():
+                        raise WorkflowError("尚未确认提交成功，已停止，不会切换到下一节。")
             self.check_stop()
-            if kind != "quiz" and not self.browser.open_quiz():
-                raise WorkflowError("未找到“学习检测”入口，已停止。")
-            if self.browser.quiz_completed():
-                self.log("已识别当前检测的提交结果，继续下一节。")
-            else:
-                questions = self.browser.get_questions()
-                if not questions:
-                    raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
-                self.state(f"识别并解答 {len(questions)} 道题")
-                screenshot = self.browser.quiz_screenshot() if self.settings.vision or self.settings.ocr else None
-                answers = self.solver.solve(questions, screenshot)
-                self.check_stop()
-                self.browser.apply_answers(answers)
-                if not self.settings.auto_submit:
-                    self.log("答案已填写；自动提交已关闭，请手动检查并提交。")
-                    self.state("等待手动提交")
-                    return completed
-                self.state("提交学习检测")
-                self.check_stop()
-                if not self.browser.submit_quiz():
-                    raise WorkflowError("尚未确认提交成功，已停止，不会切换到下一节。")
             completed += 1
-            self.log(f"第 {completed} 节检测已提交。")
+            self.log(f"第 {completed} 个学习页面已处理完成，准备点击下一节。")
             self.check_stop()
             if not self.browser.next_chapter():
                 self.state("课程处理结束")
-                self.log(f"未发现可进入的下一节，本次完成 {completed} 节。")
+                self.log(f"未发现可进入的下一节，本次完成 {completed} 个学习页面。")
                 return completed
-        self.state("已达到章节上限")
-        self.log(f"已处理 {completed} 节，达到配置上限。")
+        self.state("已达到学习页面上限")
+        self.log(f"已处理 {completed} 个学习页面，达到配置上限。")
         return completed
