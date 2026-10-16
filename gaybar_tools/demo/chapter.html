@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学生学习页面 · 本地演示</title><link rel="stylesheet" href="style.css"><script src="common.js"></script></head>
+<body><header><a href="home.html">← 返回课程</a><span>章节详情 · 本地演示</span></header><div class="layout"><main><h1 id="chapter-title"></h1><nav class="tabs"><button id="knowledge-tab" class="primary" data-testid="knowledge-tab">1 安全知识</button><button id="quiz-tab" data-testid="quiz-tab">2 学习检测</button></nav><div id="task-status" class="status" role="status">任务点待完成</div><iframe id="content-frame" title="章节活动"></iframe><div class="chapter-nav"><button disabled>上一节</button><button id="next-chapter" class="primary" data-testid="next-chapter" disabled>下一节</button></div></main><aside><div class="aside-tabs"><strong>目录</strong><span>讨论</span><span>笔记</span><span>标注</span></div><h3>1 安全教育</h3><a id="chapter-one" href="chapter.html?chapterId=1&amp;courseId=demo">1.1 大学生与国家安全 <span class="badge">1</span></a><a id="chapter-two" href="chapter.html?chapterId=2&amp;courseId=demo">1.2 安全文档阅读 <span class="badge">1</span></a><p class="notice">演示页面只记录真实播放、滚动和提交事件。请在软件中点击“开始”。</p></aside></div>
+<script>
+const chapter = window.demoChapter;
+const frame = document.getElementById('content-frame');
+const kind = chapter === '1' ? 'video' : 'document';
+document.getElementById('chapter-title').textContent = chapter === '1' ? '大学生与国家安全' : '安全文档阅读';
+document.getElementById(chapter === '1' ? 'chapter-one' : 'chapter-two').classList.add('active');
+function showActivity(activity) {
+  frame.src = `frame.html?kind=${activity}&chapterId=${chapter}`;
+  document.getElementById('knowledge-tab').classList.toggle('primary', activity !== 'quiz');
+  document.getElementById('quiz-tab').classList.toggle('primary', activity === 'quiz');
+}
+document.getElementById('knowledge-tab').addEventListener('click',()=>showActivity(kind));
+document.getElementById('quiz-tab').addEventListener('click',event=>{recordDemo('navigation',{quizTabClicked:true,quizTabTrusted:event.isTrusted});showActivity('quiz');});
+document.getElementById('next-chapter').addEventListener('click',event=>{
+  recordDemo('navigation',{nextClicked:true,nextTrusted:event.isTrusted});
+  location.href = chapter === '1' ? 'chapter.html?chapterId=2&courseId=demo' : 'complete.html';
+});
+addEventListener('message',event=>{
+  if(event.origin!==location.origin || event.data?.source!=='gaybar-demo' || event.data.chapterId!==chapter)return;
+  if(event.data.type==='content-complete')document.getElementById('task-status').textContent='任务点已完成';
+  if(event.data.type==='quiz-complete'){
+    document.getElementById('task-status').textContent='学习检测已提交';
+    document.getElementById('next-chapter').disabled=false;
+  }
+});
+showActivity(kind);
+</script></body></html>
