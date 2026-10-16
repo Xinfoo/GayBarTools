@@ -36,7 +36,7 @@ class PreloadNoneVideoIntegrationTests(unittest.TestCase):
         self.assertTrue(self.browser.quiz_completed())
         solver = Mock()
         solver.solve.side_effect = AssertionError("已提交测验后的导航回归不应调用模型或重新作答")
-        original_watch = self.browser.watch_video
+        original_watch = self.browser._watch_video_targets
         entered_watch = []
 
         def watch_after_navigation(*args, **kwargs):
@@ -51,7 +51,7 @@ class PreloadNoneVideoIntegrationTests(unittest.TestCase):
             self.assertTrue(video.locator("xpath=..").locator(".vjs-big-play-button").is_visible())
             return original_watch(*args, **kwargs)
 
-        with patch.object(self.browser, "watch_video", side_effect=watch_after_navigation):
+        with patch.object(self.browser, "_watch_video_targets", side_effect=watch_after_navigation):
             completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
         self.assertEqual(entered_watch, [True])
         solver.solve.assert_not_called()

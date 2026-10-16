@@ -15,7 +15,7 @@
 | 浏览器输入事件 | 使用 Playwright 的 `mouse.move()`、`mouse.click()`、`mouse.wheel()` 操作浏览器 | 常规填答通过点击控件完成，没有通过 JavaScript 直接写入选中状态 |
 | 分段滚轮与随机间隔 | 每次向下发送 **650～1000** 的滚轮位移，随后等待 **0.18～0.32 秒** | 当前已使用加快后的滚动参数；实际滚动距离还受页面容器和浏览器行为影响 |
 
-普通播放按钮、选择答案、提交、网页内提交确认按钮和“下一节”都使用 `_click()`。该方法先确认控件可见、可用、能够接收点击，并在必要时滚入视野，再执行随机落点和鼠标输入。视频或文档完成后统一点击右下角“下一节”，再识别是否进入答题页，不依赖固定的“2 学习检测”页签。
+普通播放按钮、选择答案、提交、网页内提交确认按钮和“下一节”都使用 `_click()`。该方法先确认控件可见、可用、能够接收点击，并在必要时滚入视野，再执行随机落点和鼠标输入。同页视频和文档从上到下全部完成后，统一点击右下角“下一节”，再识别是否进入答题页，不依赖固定的“2 学习检测”页签。
 
 这些随机参数各自独立抽取，尚未建立按用户习惯、题目难度或阅读字数调整操作节奏的模型。
 
@@ -90,6 +90,7 @@
 | [test_preload_none_video_integration.py](../tests/test_preload_none_video_integration.py) | 未预载及延迟启动视频的单次播放点击、正常播放与自然结束、空播放器不提前放行 |
 | [test_video_quiz_integration.py](../tests/test_video_quiz_integration.py) | 中途插题的选项、提交和继续学习输入事件；连续插题、嵌套 iframe 与局部截图；答题后自然播放结束、无 seek 和倍速变化 |
 | [test_document_scroll_integration.py](../tests/test_document_scroll_integration.py) | 正文内实际滚轮、到达底部、避开外层和目录，以及嵌套 iframe、遮挡和懒加载场景 |
+| [test_mixed_tasks_integration.py](../tests/test_mixed_tasks_integration.py) | 多文档和视频混排的真实操作顺序、同地址独立阅读器、动态新增内容，以及失败或停止后不进入下一节 |
 | [test_cookie_integration.py](../tests/test_cookie_integration.py) | 会话恢复、退出登录后的快照更新、普通与演示配置分离 |
 
 本地测试检查了相应输入事件的 `isTrusted` 属性，但该属性不能证明操作者是真人，也不能代表学习通对自动化的识别结果。目前没有平台风控通过率、封禁概率或“无法检测”的实测结论。真实站点与本地演示的差异见 [录屏分析与验证范围](VIDEO_NOTES.md)。

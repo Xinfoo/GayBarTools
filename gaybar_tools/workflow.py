@@ -36,6 +36,11 @@ class Workflow:
         self.state("视频播放与插入题处理中")
         return answers
 
+    def _content_task_state(self, kind: str, index: int, total: int) -> None:
+        self.check_stop()
+        action = "视频正常播放中（自动处理插入题）" if kind == "video" else "阅读静态页面"
+        self.state(f"任务点 {index}/{total}：{action}")
+
     def run(self) -> int:
         visited: set[str] = set()
         completed = 0
@@ -52,12 +57,9 @@ class Workflow:
                 raise WorkflowError("学习页面没有变化或发生循环，已停止。")
             visited.add(key)
             self.state(f"正在处理第 {completed + 1} 个学习页面")
-            if kind == "video":
-                self.state("视频正常播放中（自动处理插入题）")
-                self.browser.watch_video(on_quiz=self._solve_video_quiz)
-            elif kind == "document":
-                self.state("阅读静态页面")
-                self.browser.read_document()
+            if kind in {"video", "document"}:
+                self.browser.process_content(on_quiz=self._solve_video_quiz,
+                                             on_task=self._content_task_state)
             elif kind == "quiz":
                 if self.browser.quiz_completed():
                     self.log("已识别当前检测的提交结果，继续下一节。")

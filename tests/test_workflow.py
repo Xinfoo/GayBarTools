@@ -126,7 +126,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.next_chapter.return_value = True
         with self.assertRaises(WorkflowError):
             self.workflow().run()
-        self.browser.watch_video.assert_called_once()
+        self.browser.process_content.assert_called_once()
 
     def test_consecutive_content_pages_do_not_require_a_quiz(self):
         self.browser.chapter_key.side_effect = ["chapter-1", "chapter-2"]
@@ -134,8 +134,9 @@ class WorkflowTests(unittest.TestCase):
         self.browser.chapter_kind.return_value = "document"
         self.browser.next_chapter.side_effect = [True, False]
         self.assertEqual(self.workflow().run(), 2)
-        self.browser.watch_video.assert_called_once()
-        self.browser.read_document.assert_called_once()
+        self.assertEqual(self.browser.process_content.call_count, 2)
+        self.browser.watch_video.assert_not_called()
+        self.browser.read_document.assert_not_called()
         self.browser.open_quiz.assert_not_called()
         self.browser.quiz_completed.assert_not_called()
         self.browser.get_questions.assert_not_called()
@@ -147,13 +148,13 @@ class WorkflowTests(unittest.TestCase):
         self.browser.poll_ready.return_value = False
         self.assertEqual(self.workflow().run(), 1)
         self.browser.prepare_start.assert_called_once()
-        self.browser.watch_video.assert_called_once()
+        self.browser.process_content.assert_called_once()
         self.browser.poll_ready.assert_not_called()
 
     def test_video_watcher_receives_the_shared_model_callback(self):
         self.browser.prepare_start.return_value = "video"
         self.workflow().run()
-        callback = self.browser.watch_video.call_args.kwargs["on_quiz"]
+        callback = self.browser.process_content.call_args.kwargs["on_quiz"]
         questions = self.browser.get_questions.return_value
         screenshot = b"synthetic-video-quiz-image"
         self.solver.solve.reset_mock()
@@ -167,8 +168,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.chapter_key.side_effect = ["chapter1-video", "chapter1-quiz", "chapter2-document", "chapter2-quiz"]
         self.browser.next_chapter.side_effect = [True, True, True, False]
         self.assertEqual(self.workflow().run(), 4)
-        self.browser.watch_video.assert_called_once()
-        self.browser.read_document.assert_called_once()
+        self.assertEqual(self.browser.process_content.call_count, 2)
         self.assertEqual(self.solver.solve.call_count, 2)
         self.assertEqual(self.browser.submit_quiz.call_count, 2)
         self.assertEqual(self.browser.next_chapter.call_count, 4)
@@ -181,7 +181,7 @@ class WorkflowTests(unittest.TestCase):
         self.browser.chapter_key.side_effect = ["chapter1-video", "chapter1-quiz"]
         self.browser.next_chapter.return_value = True
         self.assertEqual(self.workflow().run(), 2)
-        self.browser.watch_video.assert_called_once()
+        self.browser.process_content.assert_called_once()
         self.browser.submit_quiz.assert_called_once()
         self.browser.chapter_kind.assert_called_once()
 
@@ -194,6 +194,21 @@ class WorkflowTests(unittest.TestCase):
         self.browser.next_chapter.assert_called_once()
         self.browser.get_questions.assert_not_called()
         self.solver.solve.assert_not_called()
+
+    def test_content_task_failure_never_advances_to_the_next_page(self):
+        self.browser.prepare_start.return_value = "video"
+        self.browser.process_content.side_effect = RuntimeError("第二个任务点处理失败")
+        with self.assertRaisesRegex(RuntimeError, "第二个任务点"):
+            self.workflow().run()
+        self.browser.next_chapter.assert_not_called()
+        self.solver.solve.assert_not_called()
+
+    def test_stop_after_a_content_task_does_not_advance(self):
+        self.browser.prepare_start.return_value = "document"
+        self.browser.process_content.side_effect = lambda **_kwargs: self.stop.set()
+        with self.assertRaises(WorkflowStopped):
+            self.workflow().run()
+        self.browser.next_chapter.assert_not_called()
 
     def test_stop_during_video_question_request_prevents_returning_answers(self):
         def solve(*_args):
