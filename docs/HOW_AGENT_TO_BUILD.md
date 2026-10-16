@@ -43,4 +43,3 @@
 ## 备注
 
 - 软件开发中未涉及到的问题可以适当自由发挥
-- 可使用DeepSeek API 进行测试，api-key: sk-c2c6a1b1a2354011b50a80abb06d66e8 Model: deepseek-flash
