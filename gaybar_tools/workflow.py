@@ -4,6 +4,7 @@ import threading
 from collections.abc import Callable
 
 from .config import AppSettings
+from .models import Answer, Question
 
 
 class WorkflowError(RuntimeError):
@@ -26,6 +27,15 @@ class Workflow:
         if self.stop_event.is_set():
             raise WorkflowStopped("已停止，浏览器保留在当前页面。")
 
+    def _solve_video_quiz(self, questions: list[Question], screenshot: bytes | None) -> list[Answer]:
+        self.check_stop()
+        self.state(f"识别并解答视频插入题（{len(questions)} 道）")
+        self.log("视频出现插入题，正在调用模型作答。")
+        answers = self.solver.solve(questions, screenshot)
+        self.check_stop()
+        self.state("视频播放与插入题处理中")
+        return answers
+
     def run(self) -> int:
         visited: set[str] = set()
         completed = 0
@@ -43,8 +53,8 @@ class Workflow:
             visited.add(key)
             self.state(f"正在处理第 {completed + 1} 节")
             if kind == "video":
-                self.state("视频正常播放中")
-                self.browser.watch_video()
+                self.state("视频正常播放中（自动处理插入题）")
+                self.browser.watch_video(on_quiz=self._solve_video_quiz)
             elif kind == "document":
                 self.state("阅读静态页面")
                 self.browser.read_document()

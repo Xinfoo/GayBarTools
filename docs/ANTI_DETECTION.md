@@ -46,6 +46,8 @@
 
 `apply_answers()` 点击页面选项，并读取最终选中状态；`submit_quiz()` 点击提交和必要的确认按钮，看到明确提交结果后才允许下一节。未确认结果时不会反复提交。已经识别为已提交的测验会跳过重新答题。
 
+视频中途插题使用播放器范围内的单独流程，点击选项及必要的“提交”“继续学习”，确认弹题关闭和视频恢复后再继续观看；不会提前点击章末“学习检测”。这些操作仍通过鼠标控件完成，不修改播放进度或网站的完成标记。截图识别和格式重试用于识别、处理插题，属于自动化功能与容错逻辑。
+
 这些属于页面交互与重复操作控制。项目没有直接请求学习通的课程完成或答题提交接口来替代页面流程。流程入口见 [workflow.py](../gaybar_tools/workflow.py)。
 
 ## 3. 浏览器与登录状态
@@ -82,6 +84,7 @@
 | 测试文件 | 核对内容 |
 | --- | --- |
 | [test_browser_integration.py](../tests/test_browser_integration.py) | 视频完整自然播放、没有 seek、倍速为 1；选项、提交、网页内确认、页签与下一节的输入事件；两章完整流程 |
+| [test_video_quiz_integration.py](../tests/test_video_quiz_integration.py) | 中途插题的选项、提交和继续学习输入事件；连续插题、嵌套 iframe 与局部截图；答题后自然播放结束、无 seek 和倍速变化 |
 | [test_document_scroll_integration.py](../tests/test_document_scroll_integration.py) | 正文内实际滚轮、到达底部、避开外层和目录，以及嵌套 iframe、遮挡和懒加载场景 |
 | [test_cookie_integration.py](../tests/test_cookie_integration.py) | 会话恢复、退出登录后的快照更新、普通与演示配置分离 |
 

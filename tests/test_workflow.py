@@ -144,6 +144,30 @@ class WorkflowTests(unittest.TestCase):
         self.browser.watch_video.assert_called_once()
         self.browser.poll_ready.assert_not_called()
 
+    def test_video_watcher_receives_the_shared_model_callback(self):
+        self.workflow().run()
+        callback = self.browser.watch_video.call_args.kwargs["on_quiz"]
+        questions = self.browser.get_questions.return_value
+        screenshot = b"synthetic-video-quiz-image"
+        self.solver.solve.reset_mock()
+        answers = callback(questions, screenshot)
+        self.solver.solve.assert_called_once_with(questions, screenshot)
+        self.assertIs(answers, self.solver.solve.return_value)
+
+    def test_stop_during_video_question_request_prevents_returning_answers(self):
+        def solve(*_args):
+            self.stop.set()
+            return [Answer("q", ("A",))]
+        self.solver.solve.side_effect = solve
+        with self.assertRaises(WorkflowStopped):
+            self.workflow()._solve_video_quiz(self.browser.get_questions.return_value, None)
+
+    def test_stopped_video_question_does_not_request_model(self):
+        self.stop.set()
+        with self.assertRaises(WorkflowStopped):
+            self.workflow()._solve_video_quiz(self.browser.get_questions.return_value, None)
+        self.solver.solve.assert_not_called()
+
     def test_demo_answers_rejected_on_remote_origin(self):
         self.browser.current_url = "https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=1"
         solver = DemoSolver(self.browser, "http://127.0.0.1:1234/chapter.html")

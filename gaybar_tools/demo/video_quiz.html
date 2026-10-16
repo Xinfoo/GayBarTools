@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>视频中途弹题 · 本地回归</title>
+<style>
+body{font:16px sans-serif;margin:20px;background:#fff;color:#222}button,label{cursor:pointer}button{padding:10px 20px}.layout{display:flex;gap:30px}.video-stage{position:relative;width:640px;height:360px;background:#111;flex:none}video{width:100%;height:100%}.vjs-big-play-button{position:absolute;left:260px;top:145px}.ans-videoquiz,.plain-overlay{position:absolute;inset:0;background:rgba(0,0,0,.92);color:white;padding:35px;box-sizing:border-box;z-index:3}.ans-videoquiz[hidden],.vjs-big-play-button[hidden],[hidden]{display:none!important}.Zy_ulTop{list-style:none;padding:0}.Zy_ulTop label{display:block;padding:14px}.quiz-buttons{position:absolute;right:25px;bottom:25px}.notice{padding-top:30px}iframe{width:350px;height:250px;border:1px solid #aaa}
+</style></head><body>
+<h1>本地视频章节</h1><nav><button id="quiz-tab">2 学习检测</button></nav>
+<div class="layout"><div class="video-stage">
+<video id="lesson-video" controls preload="auto" playsinline src="lesson.webm"></video>
+<button class="vjs-big-play-button" aria-label="播放视频">▶ 播放</button>
+<section class="ans-videoquiz" data-video-quiz hidden>
+<div class="TiMu" data-question-id="reused-video-question"><h3 class="Zy_TItle"></h3>
+<ul class="Zy_ulTop"><li><label><input type="radio" name="inserted-question" value="A"><span>A. 对</span></label></li><li><label><input type="radio" name="inserted-question" value="B"><span>B. 错</span></label></li></ul></div>
+<p id="popup-result" role="status"></p><div class="quiz-buttons"><button id="popup-submit">提交</button><button id="popup-continue" hidden>继续学习</button></div>
+</section></div><iframe title="无关的兄弟框架题目" srcdoc="<section class='TiMu' data-question-id='sibling-must-not-answer'><h3 class='Zy_TItle'>【判断题】兄弟框架学习检测题，绝不可点击。</h3><label><input type='radio' name='decoy' value='A'>A. 对</label><label><input type='radio' name='decoy' value='B'>B. 错</label><button>提交</button><script>addEventListener('click',()=>parent.recordDecoy('sibling'))</script>"></iframe></div>
+<section class="TiMu notice" data-question-id="outside-must-not-answer"><h3 class="Zy_TItle">【判断题】播放器之外的学习检测题，绝不可点击。</h3><label><input type="radio" name="outside" value="A">A. 对</label><label><input type="radio" name="outside" value="B">B. 错</label><button id="outside-submit">提交</button></section>
+<section class="TiMu" data-question-id="hidden-must-not-answer" hidden><h3 class="Zy_TItle">【判断题】隐藏的无关题。</h3><label><input type="radio" value="A">A. 对</label><label><input type="radio" value="B">B. 错</label></section>
+<p id="video-status" role="status">等待真实播放</p>
+<script>
+const mode=new URLSearchParams(location.search).get('mode')||'sequence';
+const video=document.getElementById('lesson-video'), popup=document.querySelector('.ans-videoquiz'), play=document.querySelector('.vjs-big-play-button');
+const submit=document.getElementById('popup-submit'), resume=document.getElementById('popup-continue'), result=document.getElementById('popup-result');
+const metrics={mode,questions:[],decoys:{outside:0,sibling:0},seekEvents:0,rateChanges:0,playbackRate:1,ended:false,plays:0};
+let shown=0,active=-1,startedAt=0;
+function persist(){localStorage.setItem('video-quiz-metrics',JSON.stringify(metrics));}
+window.recordDecoy=function(kind){metrics.decoys[kind]++;persist();};
+document.querySelector('[data-question-id="outside-must-not-answer"]').addEventListener('click',()=>recordDecoy('outside'));
+function current(){return metrics.questions[active];}
+function showQuestion(){
+  active=shown++;
+  metrics.questions.push({index:active,id:'reused-video-question',inputClicks:0,submitClicks:0,continueClicks:0,trusted:[],resolved:false,shownAt:video.currentTime});
+  popup.querySelector('.Zy_TItle').textContent=active===0?'【判断题】视频中的第一道题：保护账号密码是正确的。':'【判断题】视频中的第二道题：随意公开账号密码是正确的。';
+  popup.querySelectorAll('input').forEach(input=>input.checked=mode==='preselected'&&input.value==='A');
+  popup.querySelector('.TiMu').hidden=false;submit.hidden=false;resume.hidden=true;result.textContent='';popup.hidden=false;video.pause();persist();
+}
+function finishQuestion(){current().resolved=true;popup.hidden=true;persist();video.play();}
+play.addEventListener('click',event=>{metrics.playTrusted=event.isTrusted;video.play();persist();});
+video.addEventListener('loadedmetadata',()=>{metrics.duration=video.duration;persist();});
+video.addEventListener('play',()=>{play.hidden=true;metrics.plays++;if(!startedAt)startedAt=performance.now();persist();});
+video.addEventListener('seeking',()=>{metrics.seekEvents++;persist();});
+video.addEventListener('ratechange',()=>{metrics.rateChanges++;metrics.playbackRate=video.playbackRate;persist();});
+video.addEventListener('timeupdate',()=>{
+  metrics.currentTime=video.currentTime;
+  if(popup.hidden && ((shown===0&&video.currentTime>=.5)||(mode==='sequence'&&shown===1&&video.currentTime>=1.65)))showQuestion();
+  persist();
+});
+popup.addEventListener('click',event=>{if(event.target.matches('input')){current().inputClicks++;current().trusted.push(event.isTrusted);persist();}});
+popup.addEventListener('change',event=>{
+  if(active===1&&mode==='sequence'&&event.target.value==='B')finishQuestion();
+});
+submit.addEventListener('click',event=>{
+  current().submitClicks++;current().trusted.push(event.isTrusted);
+  const selected=popup.querySelector('input:checked');
+  if(!selected||selected.value!=='A'||mode==='wrong'){result.textContent='回答错误，请重新作答';persist();return;}
+  current().correct=true;submit.hidden=true;resume.hidden=false;result.textContent='回答正确！请点击继续学习。';persist();
+});
+resume.addEventListener('click',event=>{current().continueClicks++;current().trusted.push(event.isTrusted);finishQuestion();});
+video.addEventListener('ended',()=>{metrics.ended=true;metrics.currentTime=video.currentTime;metrics.elapsed=(performance.now()-startedAt)/1000;document.getElementById('video-status').textContent='视频已自然播放完成';document.querySelector('[data-question-id="outside-must-not-answer"]').hidden=true;document.querySelector('iframe').remove();persist();});
+document.getElementById('quiz-tab').addEventListener('click',event=>{metrics.quizTabTrusted=event.isTrusted;persist();location.href='quiz.html?chapterId=video-inserts&courseId=local';});
+window.mutateActiveQuestion=function(){popup.querySelector('.Zy_TItle').textContent='【判断题】模型请求期间新换上的题目，旧答案不可点击。';};
+persist();
+</script></body></html>

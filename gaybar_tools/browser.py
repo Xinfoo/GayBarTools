@@ -46,6 +46,16 @@ _NEXT = re.compile(r"^下[一1]节(?:\s*[>›»])?$")
 _SUBMIT = re.compile(r"^(?:提交|提交答案|提交作业|交卷)$")
 _RESULT = re.compile(r"(?:提交成功|已提交|作业已完成|测验已完成|我的答案\s*[:：]|本次得分|本次成绩|最终成绩)")
 _SUBMITTED_RESULT = re.compile(r"提交成功|已提交|作业已完成|测验已完成")
+# Compatibility candidates, not selectors confirmed from the reference video.
+# Geometry and the owning player frame are checked before these are accepted.
+_VIDEO_QUIZ_ROOTS = ("[data-video-quiz], .ans-videoquiz, .ans-videoquiz-container, #videoquiz, "
+                     ".video-quiz, .videoquiz, .vjs-modal-dialog, [role=dialog]")
+_VIDEO_QUESTION_BLOCKS = _QUESTION_BLOCKS + (".tk_topic", ".tkTopic", ".videoquiz-question")
+_VIDEO_TITLES = _QUESTION_TITLES + ", .tk_title, .tk-title, .tkTopic_title, .topic-title"
+_VIDEO_OPTIONS = (".tkitem, .tkItem, .tk-item, .tk-option, .videoquiz-options > li",) + _OPTION_SELECTORS
+_VIDEO_CONTINUE = re.compile(r"^(?:继续学习|继续播放|返回视频)$")
+_VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)")
+_VIDEO_RIGHT = re.compile(r"恭喜.*(?:答对|正确)|(?:回答|答案|作答)正确|答对了")
 
 
 def _clean(value: str) -> str:
@@ -53,6 +63,10 @@ def _clean(value: str) -> str:
 
 
 class BrowserSession:
+    VIDEO_QUIZ_WAIT_TIMEOUT = 15.0
+    PAUSED_QUIZ_GRACE = 1.0
+    VIDEO_QUIZ_POLL_INTERVAL = 0.2
+
     def __init__(self, settings: AppSettings, paths: AppPaths,
                  log: Callable[[str], None], stop_event: threading.Event) -> None:
         self.settings, self.paths = settings, paths
@@ -351,7 +365,7 @@ class BrowserSession:
                 continue
         return None
 
-    def _text_control(self, pattern: re.Pattern[str], *, root: Any = None) -> Any | None:
+    def _text_control(self, pattern: re.Pattern[str], *, root: Any = None, video_quiz: bool = False) -> Any | None:
         for frame in [root] if root is not None else self._frames():
             for selector in ("button, a, [role=button], [role=tab], input[type=submit], input[type=button]",
                              "li, span, div"):
@@ -360,7 +374,7 @@ class BrowserSession:
                     for index in range(min(candidates.count(), 120)):
                         loc = candidates.nth(index)
                         text = _clean(loc.inner_text(timeout=600)) or _clean(loc.get_attribute("value") or "")
-                        if pattern.fullmatch(text) and self._visible(loc):
+                        if pattern.fullmatch(text) and (self._video_visible(loc) if video_quiz else self._visible(loc)):
                             if loc.evaluate("e => e.children.length > 3 && !['BUTTON','A'].includes(e.tagName)"):
                                 continue
                             return loc
@@ -587,12 +601,275 @@ class BrowserSession:
         self._page.mouse.click(x, y, delay=random.uniform(65, 140))
         self._delay()
 
-    def watch_video(self) -> None:
+    def watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
         try:
-            self._watch_video()
-        except BrowserError:
+            self._watch_video(on_quiz)
+        except Exception:
             self._pause_video_on_stop()
             raise
+
+    @staticmethod
+    def _overlaps_video(box: dict | None, video_box: dict | None) -> bool:
+        if not box or not video_box:
+            return False
+        area = min(box["width"] * box["height"], video_box["width"] * video_box["height"])
+        width = min(box["x"] + box["width"], video_box["x"] + video_box["width"]) - max(box["x"], video_box["x"])
+        height = min(box["y"] + box["height"], video_box["y"] + video_box["height"]) - max(box["y"], video_box["y"])
+        return area > 0 and max(0, width) * max(0, height) >= area * 0.2
+
+    def _video_frame(self, video: Any) -> Any:
+        handle = video.element_handle(timeout=2000)
+        if handle is None:
+            raise BrowserError("视频播放器已发生变化，请确认当前章节。")
+        try:
+            frame = handle.owner_frame()
+        finally:
+            handle.dispose()
+        if frame is None:
+            raise BrowserError("无法确定视频所在页面。")
+        return frame
+
+    def _video_visible(self, locator: Any) -> bool:
+        """Opacity-hidden preloaded prompts are not currently displayed quizzes."""
+        self._check_stop()
+        visible_ancestors = """e => {
+            for(let node=e;node;node=node.parentElement){
+                const style=getComputedStyle(node);
+                if(style.display==='none' || style.visibility==='hidden' || style.visibility==='collapse'
+                   || Number(style.opacity)===0 || style.contentVisibility==='hidden')return false;
+            }
+            return true;
+        }"""
+        try:
+            if not self._visible(locator) or not locator.evaluate(visible_ancestors):
+                return False
+            handle = locator.element_handle(timeout=1000)
+            if handle is None:
+                return False
+            try:
+                frame = handle.owner_frame()
+            finally:
+                handle.dispose()
+            # Computed styles do not cross iframe document boundaries. Inspect
+            # the embedding elements and their ancestors separately as well.
+            while frame is not None and frame.parent_frame is not None:
+                element = frame.frame_element()
+                try:
+                    if not element.is_visible() or not element.evaluate(visible_ancestors):
+                        return False
+                finally:
+                    element.dispose()
+                frame = frame.parent_frame
+            return frame is not None
+        except (BrowserError, StopRequested):
+            raise
+        except Exception:
+            return False
+
+    def _video_question_blocks(self, root: Any, video: Any) -> list[Any]:
+        """Read only visible question controls overlapping this player."""
+        if not self._video_visible(root):
+            return []
+        video_box = video.bounding_box(timeout=1000)
+        for selector in _VIDEO_QUESTION_BLOCKS:
+            locators = root.locator(selector)
+            blocks = [locators.nth(index) for index in range(min(locators.count(), 100))
+                      if self._video_visible(locators.nth(index))
+                      and self._overlaps_video(locators.nth(index).bounding_box(timeout=1000), video_box)]
+            if blocks:
+                return blocks
+        # Some players render a plain overlay with a title and radio labels,
+        # without any of the assessment question classes above.
+        if (self._overlaps_video(root.bounding_box(timeout=1000), video_box)
+                and len(self._option_candidates(root, video_quiz=True, video=video)) >= 2):
+            text = _clean(root.inner_text(timeout=1500))
+            if re.search(r"(?:单选|多选|判断)题", text) or root.locator(_VIDEO_TITLES).count():
+                return [root]
+        return []
+
+    def _find_video_quiz(self, video: Any) -> Any | None:
+        """Find a prompt belonging to this player, never a sibling assessment."""
+        frame = self._video_frame(video)
+        if not self._frame_visible(frame):
+            return None
+        video_box = video.bounding_box(timeout=1000)
+        candidates: list[Any] = []
+        explicit = frame.locator(_VIDEO_QUIZ_ROOTS)
+        candidates.extend(explicit.nth(index) for index in range(min(explicit.count(), 60)))
+
+        # A DOM-independent fallback for the full-player question mask shown
+        # in Example3. It must overlap the actual video, contain question-like
+        # controls, and cannot be an outer element containing that video.
+        overlays = frame.locator("div, section, article, form, dialog")
+        handle = video.element_handle(timeout=2000)
+        if handle is not None:
+            try:
+                indices = overlays.evaluate_all(r"""(elements, video) => {
+                    const v=video.getBoundingClientRect(), va=v.width*v.height;
+                    return elements.map((e,index)=>{
+                        if(e.contains(video))return null;
+                        const r=e.getBoundingClientRect(), s=getComputedStyle(e), area=r.width*r.height;
+                        if(area<=0 || area>va*2.5 || s.display==='none' || s.visibility==='hidden'
+                           || Number(s.opacity)===0)return null;
+                        const overlap=Math.max(0,Math.min(r.right,v.right)-Math.max(r.left,v.left))
+                            *Math.max(0,Math.min(r.bottom,v.bottom)-Math.max(r.top,v.top));
+                        if(overlap<Math.min(area,va)*.2)return null;
+                        if(e.querySelectorAll('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox]').length<2
+                           && e.querySelectorAll('label,.option,.tkitem,.tkItem').length<2)return null;
+                        if(!/(单选|多选|判断)题/.test(e.innerText||'')
+                           && !e.querySelector('[data-question-id],.TiMu,.questionLi,.question-item,.question,fieldset,.tk_topic,.tkTopic'))return null;
+                        return {index,area};
+                    }).filter(Boolean).sort((a,b)=>b.area-a.area).slice(0,30).map(x=>x.index);
+                }""", handle)
+                candidates.extend(overlays.nth(index) for index in indices)
+            finally:
+                handle.dispose()
+
+        # Prefer the nearest player wrapper, not arbitrary ancestors such as
+        # the chapter body. Its contained overlay iframe is also in scope.
+        wrapper = video.locator("xpath=..")
+        for depth in range(4):
+            if not wrapper.count():
+                break
+            tag = wrapper.evaluate("e => e.tagName")
+            box = wrapper.bounding_box(timeout=1000)
+            if tag in {"BODY", "HTML"}:
+                break
+            player_wrapper = depth == 0 or wrapper.evaluate("""e => e.matches(
+                '.video-js, .video-stage, .ans-video, .ans-video-player, .video-container, '
+                + '.video-player, .player-container, [data-video-player], #video, #video-player, #videoPlayer')""")
+            if (player_wrapper and box and video_box and self._overlaps_video(box, video_box)
+                    and box["width"] * box["height"] <= video_box["width"] * video_box["height"] * 2.5):
+                candidates.append(wrapper)
+            wrapper = wrapper.locator("xpath=..")
+
+        for root in candidates:
+            self._check_stop()
+            try:
+                if not self._video_visible(root) or not self._overlaps_video(root.bounding_box(timeout=1000), video_box):
+                    continue
+                if self._video_question_blocks(root, video):
+                    return root
+                # Only descend through iframes physically inside an accepted
+                # player/overlay root. Sibling course and quiz frames stay out.
+                for child in frame.child_frames:
+                    element = child.frame_element()
+                    try:
+                        contained = root.evaluate("(root, child) => root.contains(child)", element)
+                    finally:
+                        element.dispose()
+                    if contained and self._frame_visible(child):
+                        body = child.locator("body")
+                        if self._video_question_blocks(body, video):
+                            return body
+            except (BrowserError, StopRequested):
+                raise
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _question_fingerprint(questions: list[Question]) -> tuple:
+        return tuple((q.id, q.text, q.kind, tuple((o.label, o.text) for o in q.options)) for q in questions)
+
+    def _video_quiz_screenshot(self, root: Any, video: Any) -> bytes:
+        # The overlay and video share viewport coordinates even across frames.
+        # Keep unrelated chapter navigation and other assessments out of vision.
+        box = video.bounding_box(timeout=2000)
+        viewport = self._page.viewport_size
+        if box and viewport:
+            x, y = max(0, box["x"]), max(0, box["y"])
+            width = min(box["x"] + box["width"], viewport["width"]) - x
+            height = min(box["y"] + box["height"], viewport["height"]) - y
+            if width > 0 and height > 0:
+                return self._page.screenshot(type="png", clip={"x": x, "y": y, "width": width, "height": height}, timeout=10000)
+        return root.screenshot(type="png", timeout=10000)
+
+    def _apply_video_answers(self, answers: list[Answer], root: Any, video: Any) -> None:
+        self._validate_answers(answers)
+        fingerprint = self._question_fingerprint(list(self._questions.values()))
+        mapped = {answer.question_id: answer for answer in answers}
+        operations: list[tuple[Any, bool]] = []
+        for question_id, question in self._questions.items():
+            desired = {str(choice).strip().upper() for choice in mapped[question_id].choices}
+            for label, control in self._question_controls[question_id].items():
+                selected = self._selected(control)
+                if question.kind == "multiple" and label not in desired and selected:
+                    operations.append((control, False))
+            for label in desired:
+                control = self._question_controls[question_id][label]
+                if self._selected(control) is not True:
+                    operations.append((control, True))
+        for index, (control, desired) in enumerate(operations):
+            self._guard()
+            self._click(control)
+            self._check_stop()
+            current = self._extract_questions([root], video=video)
+            self._check_stop()
+            if current and self._question_fingerprint(current) != fingerprint:
+                raise BrowserError("选择答案后视频弹题发生变化，已停止以免提交未经解答的题目。")
+            if not current:
+                if index + 1 != len(operations):
+                    raise BrowserError("视频弹题在答案尚未填完时发生变化，已停止。")
+                return  # Selecting the final answer may close the whole prompt.
+            if self._selected(control) is not desired:
+                raise BrowserError("无法确认视频弹题选项已正确选中。")
+
+    def _handle_video_quiz(self, root: Any, video: Any,
+                           on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None) -> None:
+        self._guard()
+        if on_quiz is None:
+            raise BrowserError("视频出现答题界面，请启动带模型解题的自动流程。")
+        old_questions, old_controls = self._questions, self._question_controls
+        try:
+            questions = self._extract_questions([root], video=video)
+            if not questions:
+                raise BrowserError("视频弹题没有可识别的选择题，请查看诊断截图。")
+            fingerprint = self._question_fingerprint(questions)
+            original_lines = {_clean(line) for line in root.inner_text(timeout=1500).splitlines()}
+            screenshot = self._video_quiz_screenshot(root, video) if self.settings.vision or self.settings.ocr else None
+            self.log(f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
+            answers = on_quiz(questions, screenshot)
+            self._guard()
+            current = self._extract_questions([root], video=video)
+            self._check_stop()
+            if self._question_fingerprint(current) != fingerprint:
+                raise BrowserError("模型回答期间视频弹题发生变化，已停止以免填写旧答案。")
+            self._apply_video_answers(answers, root, video)
+            deadline = time.monotonic() + self.VIDEO_QUIZ_WAIT_TIMEOUT
+            submitted = continued = False
+            while time.monotonic() < deadline:
+                self._guard()
+                active = bool(self._video_question_blocks(root, video))
+                state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
+                text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
+                feedback = " ".join(_clean(line) for line in text.splitlines() if _clean(line) not in original_lines)
+                if submitted and _VIDEO_WRONG.search(feedback):
+                    raise BrowserError("视频弹题答案未通过，已保留当前页面，请检查题目。")
+                continuation = self._text_control(_VIDEO_CONTINUE, root=root, video_quiz=True) if self._video_visible(root) else None
+                submit = self._text_control(_SUBMIT, root=root, video_quiz=True) if not submitted and active else None
+                if (continuation is not None and not continued
+                        and (submitted or _VIDEO_RIGHT.search(feedback) or submit is None)):
+                    self._click(continuation)
+                    continued = True
+                elif continuation is None and not active and (not state["paused"] or state["ended"]):
+                    self.log("视频弹题已处理，播放器已恢复。")
+                    return
+                elif submit is not None:
+                    current = self._extract_questions([root], video=video)
+                    self._check_stop()
+                    if current and self._question_fingerprint(current) != fingerprint:
+                        raise BrowserError("提交前视频弹题发生变化，已停止以免提交未经解答的题目。")
+                    if not current:
+                        self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                        continue
+                    self._click(submit)
+                    submitted = True
+                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+            self._check_stop()
+            raise BrowserError("视频弹题未能通过或未恢复播放，请检查当前题目；不会重复提交或跳过视频。")
+        finally:
+            self._questions, self._question_controls = old_questions, old_controls
 
     def _pause_video_on_stop(self) -> None:
         # Stop must not leave a launched lesson playing in the background. Use a
@@ -614,7 +891,7 @@ class BrowserSession:
         except Exception:
             self.log("停止后未能确认播放器暂停，请手动检查浏览器。")
 
-    def _watch_video(self) -> None:
+    def _watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
         self._guard()
         videos = self._video_locators()
         if not videos:
@@ -623,6 +900,7 @@ class BrowserSession:
         for number, video in enumerate(videos, start=1):
             self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
             last_position, progressed_at, resumed_at = -1.0, time.monotonic(), 0.0
+            paused_since = 0.0
             while True:
                 self._guard()
                 if time.monotonic() > deadline:
@@ -637,6 +915,16 @@ class BrowserSession:
                     raise BrowserError(f"播放器错误：{state['error']}")
                 if abs(float(state["rate"]) - 1) > 0.01:
                     raise BrowserError("检测到视频播放速度不是 1 倍，请手动恢复后再开始。")
+                if state["paused"] or state["ended"]:
+                    prompt = self._find_video_quiz(video)
+                    if prompt is not None:
+                        started = time.monotonic()
+                        self._handle_video_quiz(prompt, video, on_quiz)
+                        self._check_stop()
+                        # Model/OCR work is not buffering time or playback time.
+                        deadline += time.monotonic() - started
+                        progressed_at, resumed_at, paused_since = time.monotonic(), 0.0, 0.0
+                        continue
                 if state["ended"]:
                     self.log("视频已自然播放结束。")
                     break
@@ -644,10 +932,15 @@ class BrowserSession:
                 if position > last_position + 0.15:
                     progressed_at, last_position = time.monotonic(), position
                 if state["paused"]:
+                    if not paused_since:
+                        paused_since = time.monotonic()
+                    if time.monotonic() - paused_since < self.PAUSED_QUIZ_GRACE:
+                        self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                        continue
                     if time.monotonic() - resumed_at < 5:
                         raise BrowserError("播放器仍暂停，可能有弹题或提示需要人工处理。")
                     play = None
-                    for frame in self._frames():
+                    for frame in [self._video_frame(video)]:
                         candidates = frame.locator("video")
                         if candidates.count() and self._visible(candidates.first):
                             play = self._first_visible(
@@ -660,6 +953,8 @@ class BrowserSession:
                     self._wait(0.5)
                 elif time.monotonic() - progressed_at > 120:
                     raise BrowserError("视频超过 120 秒没有进展，请检查缓冲或提示。")
+                else:
+                    paused_since = 0.0
                 if time.monotonic() - self._last_video_log > 30:
                     self.log(f"视频进度 {int(position)} / {int(state['duration'])} 秒。")
                     self._last_video_log = time.monotonic()
@@ -953,31 +1248,41 @@ class BrowserSession:
             self._wait(0.4)
         raise BrowserError("点击学习检测后未出现可识别的测验，请检查页面。")
 
-    def _option_candidates(self, block: Any) -> list[Any]:
-        for selector in _OPTION_SELECTORS:
+    def _option_candidates(self, block: Any, *, video_quiz: bool = False, video: Any = None) -> list[Any]:
+        video_box = video.bounding_box(timeout=1000) if video is not None else None
+        is_visible = self._video_visible if video_quiz else self._visible
+        for selector in _VIDEO_OPTIONS if video_quiz else _OPTION_SELECTORS:
             candidates = block.locator(selector)
             result = [candidates.nth(index) for index in range(min(candidates.count(), 30))
-                      if self._visible(candidates.nth(index))]
+                      if is_visible(candidates.nth(index))
+                      and (video is None or self._overlaps_video(candidates.nth(index).bounding_box(timeout=1000), video_box))]
             if len(result) >= 2:
                 return result
         inputs = block.locator("input[type=radio], input[type=checkbox]")
         return [inputs.nth(index) for index in range(min(inputs.count(), 30))
-                if self._visible(inputs.nth(index))]
+                if is_visible(inputs.nth(index))
+                and (video is None or self._overlaps_video(inputs.nth(index).bounding_box(timeout=1000), video_box))]
 
     def get_questions(self) -> list[Question]:
+        return self._extract_questions(self._frames())
+
+    def _extract_questions(self, roots: list[Any], *, video: Any = None) -> list[Question]:
         self._guard()
-        self._question_controls.clear()
-        self._questions.clear()
+        self._question_controls = {}
+        self._questions = {}
         questions: list[Question] = []
-        for frame_number, frame in enumerate(self._frames()):
+        for frame_number, frame in enumerate(roots):
             blocks: list[Any] = []
-            for selector in _QUESTION_BLOCKS:
-                locs = frame.locator(selector)
-                valid = [locs.nth(index) for index in range(min(locs.count(), 200))
-                         if self._visible(locs.nth(index))]
-                if valid:
-                    blocks = valid
-                    break
+            if video is not None:
+                blocks = self._video_question_blocks(frame, video)
+            else:
+                for selector in _QUESTION_BLOCKS:
+                    locs = frame.locator(selector)
+                    valid = [locs.nth(index) for index in range(min(locs.count(), 200))
+                             if self._visible(locs.nth(index))]
+                    if valid:
+                        blocks = valid
+                        break
             for index, block in enumerate(blocks):
                 self._check_stop()
                 raw_text = block.inner_text(timeout=2000)
@@ -986,13 +1291,14 @@ class BrowserSession:
                     continue
                 if re.search(r"\[(?:填空|简答|论述|连线|排序|阅读|计算)题\]|【(?:填空|简答|论述)题】", text):
                     raise BrowserError("检测到尚不支持的题型；只支持单选、多选和判断。")
-                candidates = self._option_candidates(block)
+                candidates = self._option_candidates(block, video_quiz=video is not None, video=video)
                 if not candidates:
                     if _RESULT.search(text):
                         continue
                     raise BrowserError("题目没有可可靠识别的选项控件，请人工查看诊断截图。")
-                title = block.locator(_QUESTION_TITLES)
-                stem = _clean(title.first.inner_text(timeout=1500)) if title.count() else _clean(raw_text.splitlines()[0])
+                title = block.locator(_VIDEO_TITLES if video is not None else _QUESTION_TITLES)
+                stem = _clean(title.first.inner_text(timeout=1500)) if title.count() else (
+                    text if video is not None else _clean(raw_text.splitlines()[0]))
                 kind = "multiple" if "多选" in stem else "boolean" if "判断" in stem else "single"
                 if block.locator("input[type=checkbox], [role=checkbox]").count():
                     kind = "multiple"
@@ -1024,7 +1330,7 @@ class BrowserSession:
                 questions.append(question)
                 self._questions[question_id] = question
                 self._question_controls[question_id] = controls
-        if not questions and not self._result_visible():
+        if not questions and video is None and not self._result_visible():
             raise BrowserError("未找到受支持的测验题目。")
         return questions
 
@@ -1044,7 +1350,7 @@ class BrowserSession:
             return null;
         }""")
 
-    def apply_answers(self, answers: list[Answer]) -> None:
+    def _validate_answers(self, answers: list[Answer]) -> None:
         self._guard()
         if not self._questions:
             raise BrowserError("请先读取题目，再填写答案。")
@@ -1059,6 +1365,10 @@ class BrowserSession:
                 raise BrowserError(f"题目 {question_id} 只能选择一个答案。")
             if not set(choices) <= set(self._question_controls[question_id]):
                 raise BrowserError(f"题目 {question_id} 包含无效选项。")
+
+    def apply_answers(self, answers: list[Answer]) -> None:
+        self._validate_answers(answers)
+        mapped = {answer.question_id: answer for answer in answers}
         for question_id, question in self._questions.items():
             desired = {str(choice).strip().upper() for choice in mapped[question_id].choices}
             for label, control in self._question_controls[question_id].items():
