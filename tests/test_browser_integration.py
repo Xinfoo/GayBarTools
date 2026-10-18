@@ -258,7 +258,6 @@ class BrowserIntegrationTests(unittest.TestCase):
             self.settings.base_url = f"http://127.0.0.1:{api.server_port}/v1"
             self.settings.model = "local-synthetic-model"
             self.settings.vision = True
-            self.assertTrue(self.settings.auto_submit)
             self.launch()
             self.wait_ready()
             solver = QuizSolver(self.settings, self.logs.append, self.stop)

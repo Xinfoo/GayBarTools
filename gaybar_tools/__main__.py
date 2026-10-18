@@ -96,7 +96,7 @@ def main(argv=None):
             # Never replace the user's saved login session during a demo.
             with tempfile.TemporaryDirectory(prefix="demo-", dir=paths.tmp) as folder:
                 demo_paths = replace(AppPaths.for_root(Path(folder)), browsers=paths.browsers).prepare()
-                settings = replace(settings, auto_submit=True, max_chapters=4)
+                settings = replace(settings, max_chapters=4)
                 stop = threading.Event()
                 browser = BrowserSession(settings, demo_paths, print, stop)
                 try:

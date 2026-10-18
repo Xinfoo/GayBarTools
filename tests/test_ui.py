@@ -44,7 +44,7 @@ class StartButtonTests(unittest.TestCase):
             for name in (
                 "base_url", "model", "api_key", "vision", "ocr",
                 "remember_key", "browser_path",
-                "max_chapters", "auto_submit",
+                "max_chapters",
             )
         }
         for name in ("launch", "start", "stop", "test", "save", "save_login"):

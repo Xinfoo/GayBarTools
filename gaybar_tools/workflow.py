@@ -46,11 +46,11 @@ class Workflow:
                   "quiz": "处理章节测验"}[kind]
         self.state(f"任务点 {index}/{total}：{action}")
 
-    def _solve_chapter_quiz(self) -> bool:
+    def _solve_chapter_quiz(self) -> None:
         self.check_stop()
         if self.browser.quiz_completed():
             self.log("已识别当前检测的提交结果，继续后续任务。")
-            return True
+            return
         questions = self.browser.get_questions()
         if not questions:
             raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
@@ -59,15 +59,10 @@ class Workflow:
         answers = self.solver.solve(questions, screenshot)
         self.check_stop()
         self.browser.apply_answers(answers)
-        if not self.settings.auto_submit:
-            self.log("答案已填写；自动提交已关闭，请手动检查并提交。")
-            self.state("等待手动提交")
-            return False
         self.state("提交当前答题区域")
         self.check_stop()
         if not self.browser.submit_quiz():
             raise WorkflowError("尚未确认提交成功，已停止，不会切换到下一节。")
-        return True
 
     def run(self) -> int:
         visited: set[str] = set()
@@ -89,13 +84,10 @@ class Workflow:
                 callbacks = {"on_quiz": self._solve_video_quiz, "on_task": self._content_task_state}
                 if kind == "mixed":
                     callbacks["on_chapter_quiz"] = self._solve_chapter_quiz
-                processed = self.browser.process_content(**callbacks)
+                self.browser.process_content(**callbacks)
                 self.check_stop()
-                if processed is None:
-                    return completed
             elif kind == "quiz":
-                if not self._solve_chapter_quiz():
-                    return completed
+                self._solve_chapter_quiz()
             self.check_stop()
             completed += 1
             self.log(f"第 {completed} 个学习页面已处理完成，准备点击下一节。")

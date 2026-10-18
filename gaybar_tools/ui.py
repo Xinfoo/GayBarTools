@@ -78,7 +78,6 @@ class Application:
         ttk.Label(options, text="学习页面上限").pack(side="left")
         self.fields["max_chapters"] = tk.StringVar(value=str(self.settings.max_chapters))
         ttk.Entry(options, textvariable=self.fields["max_chapters"], width=7).pack(side="left", padx=(6, 18))
-        self.check(options, "答题页自动提交并继续下一节", "auto_submit").pack(side="left")
 
         login = ttk.Frame(runtime)
         login.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))

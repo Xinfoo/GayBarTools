@@ -1899,8 +1899,8 @@ class BrowserSession:
 
     def process_content(self, *,
                         on_quiz: VideoQuizSolver | None = None,
-                        on_chapter_quiz: Callable[[], bool] | None = None,
-                        on_task: Callable[[str, int, int], None] | None = None) -> int | None:
+                        on_chapter_quiz: Callable[[], None] | None = None,
+                        on_task: Callable[[str, int, int], None] | None = None) -> int:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
         completed: set[str] = set()
@@ -1978,8 +1978,7 @@ class BrowserSession:
                         if on_chapter_quiz is None:
                             raise BrowserError("当前页面包含章节测验，需要通过完整学习流程处理。")
                         with self.quiz_scope(task.target):
-                            if not on_chapter_quiz():
-                                return None  # Filled for manual submission; do not advance.
+                            on_chapter_quiz()
                     else:
                         self._read_document_targets([task.target])
                     completed.add(task.identity)

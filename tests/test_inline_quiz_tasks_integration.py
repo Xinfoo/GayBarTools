@@ -243,25 +243,6 @@ class InlineQuizTasksIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics["tasks"]["quiz-a"]["answerClicks"], 0)
         self.assertEqual(metrics["tasks"]["quiz-a"]["submitClicks"], 0)
 
-    def test_manual_submission_stops_at_first_inline_quiz_before_later_media_or_next(self):
-        from gaybar_tools.workflow import Workflow
-
-        self.launch_inline()
-        self.settings.auto_submit = False
-        solver, observed = self.solver(("quiz-a",))
-        completed = Workflow(self.browser, solver, self.settings, self.stop, self.logs.append).run()
-        self.assertEqual(completed, 0)
-        self.assertEqual(observed, ["quiz-a"])
-        metrics = self.metrics()
-        self.assertEqual(metrics["completed"], ["doc-a"])
-        self.assertEqual(metrics["tasks"]["quiz-a"]["answerClicks"], 1)
-        self.assertEqual(metrics["tasks"]["quiz-a"]["submitClicks"], 0)
-        self.assertEqual(metrics["tasks"]["video"]["playClicks"], 0)
-        self.assertEqual(metrics["tasks"]["quiz-b"]["answerClicks"], 0)
-        self.assertEqual(metrics["tasks"]["doc-b"]["wheels"], 0)
-        self.assertEqual(metrics["nextClicks"], 0)
-        self.assertEqual(metrics["violations"], [])
-
     def test_loading_inline_quiz_before_video_waits_for_form_and_keeps_order(self):
         from gaybar_tools.workflow import Workflow
 
