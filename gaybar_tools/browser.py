@@ -611,7 +611,8 @@ class BrowserSession:
 
         Only semantic content changes count as a new activity. Updating the
         outer URL/title while an old iframe is still on screen must not release
-        the transition wait. An empty or loading document supplies no signature.
+        the transition wait. Readiness follows the first pending task; later
+        attachments can finish loading before their own turn.
         """
         parts: list[Any] = []
         ready = True
@@ -621,13 +622,14 @@ class BrowserSession:
             # stable signature, rather than viewport/scroll coordinates.
             content = self.content_tasks(include_occluded=True) if include_occluded else self.content_tasks()
             tasks = sorted(content, key=lambda task: tuple(segment[2] for segment in task.order))
+            pending_ready: dict[str, bool] = {}
             for task in tasks:
                 if task.region:
                     parts.append(("task-region", task.kind, task.region))
                     if task.completed:
                         continue
                     if task.placeholder:
-                        ready = False
+                        pending_ready[task.identity] = False
                         continue
                 if task.kind == "video":
                     state = task.target.evaluate("""e => ({
@@ -638,18 +640,24 @@ class BrowserSession:
                     source = "" if state["source"].startswith("blob:") else state["source"]
                     if not task.region:
                         parts.append(("video", source, state["poster"], state["id"]))
-                    # preload="none" metadata is unavailable before play.
-                    ready = ready and bool(state["source"])
+                    # Some players attach their media only after a real play
+                    # click. A mounted player is enough for navigation; the
+                    # playback workflow handles loading after that click.
+                    pending_ready[task.identity] = True
                 else:
                     data = self._document_semantic(task.target)
                     if re.fullmatch(r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", data["text"]):
-                        ready = False
+                        pending_ready[task.identity] = False
                         continue
                     if data["text"] or data["media"]:
                         if not task.region:
                             parts.append(("document", data["text"], data["media"]))
-                    else:
-                        ready = False
+                    pending_ready[task.identity] = bool(data["text"] or data["media"])
+            # Later readers may load only after the preceding video finishes
+            # or after they scroll into view. They cannot hold navigation to
+            # an already usable first task; execution handles tasks in order.
+            ready = next((pending_ready[task.identity] for task in content
+                          if task.identity in pending_ready), bool(tasks))
         elif kind == "quiz":
             for frame in self._frames():
                 if not self._frame_visible(frame):
@@ -2480,8 +2488,6 @@ class BrowserSession:
             self._wait(0.25)
         if kind == "quiz" and not content_ready:
             raise BrowserError("已检测到答题内容，但未能完整读取题干和选项，请检查页面是否加载完成。")
-        if kind == "video" and not content_ready:
-            raise BrowserError("已检测到视频播放器，但媒体来源尚未加载，请检查页面是否加载完成。")
         raise BrowserError("点击下一节后章节没有变化，已停止以防循环。")
 
     def capture_diagnostic(self) -> Path | None:

@@ -3,6 +3,7 @@
 <link rel="stylesheet" href="style.css"><style>
 main{max-width:1000px;margin:auto}#content-frame{height:450px}.video-js{position:relative;width:640px;height:360px;background:black}
 .vjs-tech{width:640px;height:360px}.vjs-big-play-button{position:absolute;top:145px;left:260px}
+#reader.document-viewer{height:240px;margin-top:28px}
 </style></head><body><div id="app"></div>
 <script>
 const params=new URLSearchParams(location.search),storageKey='preload-none-video-metrics';
@@ -11,12 +12,30 @@ function update(values){localStorage.setItem(storageKey,JSON.stringify({...metri
 const app=document.getElementById('app');
 if(params.get('view')==='player'){
   document.body.className='activity-body';
-  const source=params.get('empty')==='1'?'':' src="lesson.webm"';
+  const source=params.get('empty')==='1'||params.get('lazy')==='1'?'':' src="lesson.webm"';
   app.innerHTML=`<div class="video-js"><video id="video_html5_api" class="vjs-tech" preload="none" controls${source}></video><button class="vjs-big-play-button" aria-label="播放视频">播放</button></div>`;
   const video=document.querySelector('video'),play=document.querySelector('.vjs-big-play-button');
+  const mixed=params.get('mixed')==='1';
+  let reader=null;
+  if(mixed){
+    reader=document.createElement('div');reader.id='reader';reader.className='document-viewer';
+    reader.textContent='正在加载...';app.append(reader);
+    reader.addEventListener('wheel',event=>update({documentWheels:(metrics().documentWheels||0)+1,
+      documentWheelTrusted:[...(metrics().documentWheelTrusted||[]),event.isTrusted],
+      documentWheelAfterVideoEnded:metrics().documentWheelAfterVideoEnded&&!!metrics().ended}));
+    reader.addEventListener('scroll',()=>{
+      const atBottom=reader.scrollTop+reader.clientHeight>=reader.scrollHeight-3;
+      update({documentScrollTop:reader.scrollTop,documentClientHeight:reader.clientHeight,
+        documentScrollHeight:reader.scrollHeight,documentAtBottom:atBottom});
+      if(atBottom)parent.postMessage({source:'preload-none-local-video',type:'document-ended'},location.origin);
+    });
+  }
   let startedAt=0,clickedAt=0;
   play.addEventListener('click',event=>{
     clickedAt=performance.now();update({playClicks:(metrics().playClicks||0)+1,playTrusted:event.isTrusted});
+    if(params.get('lazy')==='1'&&event.isTrusted&&!video.getAttribute('src')){
+      video.src='lesson.webm';update({sourceAddedOnTrustedPlay:true});
+    }
     const delay=Number(params.get('delay')||0);
     if(delay>0)setTimeout(()=>video.play(),delay);else video.play();
   });
@@ -25,10 +44,15 @@ if(params.get('view')==='player'){
   video.addEventListener('ratechange',()=>update({playbackRate:video.playbackRate}));
   video.addEventListener('ended',()=>{
     update({ended:true,duration:video.duration,currentTime:video.currentTime,elapsed:(performance.now()-startedAt)/1000,playbackRate:video.playbackRate});
+    if(reader){
+      reader.innerHTML=Array.from({length:3},(_,index)=>`<article class="document-page"><h2>本地阅读正文 ${index+1}</h2><p>${'视频结束后才加载的独立文档正文。'.repeat(25)}</p></article>`).join('');
+      update({documentLoadedAfterVideoEnded:true});
+    }
     parent.postMessage({source:'preload-none-local-video',type:'ended'},location.origin);
   });
 }else{
-  update({playClicks:0,nextTrusted:[],seekEvents:0,playbackRate:1,ended:false});
+  update({playClicks:0,nextTrusted:[],seekEvents:0,playbackRate:1,ended:false,sourceAddedOnTrustedPlay:false,
+    documentWheels:0,documentWheelTrusted:[],documentWheelAfterVideoEnded:true,documentAtBottom:false});
   app.innerHTML='<main><h1>测验完成后的下一学习活动</h1><section id="submitted-result"><div class="submit-success">提交成功 · 已完成本节测验</div></section><iframe id="content-frame" title="下一节视频播放器" hidden></iframe><nav class="chapter-nav"><button id="next-chapter">下一节</button></nav></main>';
   const frame=document.getElementById('content-frame'),next=document.getElementById('next-chapter');
   let atVideo=false;
@@ -36,10 +60,11 @@ if(params.get('view')==='player'){
     update({nextTrusted:[...metrics().nextTrusted,event.isTrusted]});
     if(atVideo){location.href='complete.html';return;}
     atVideo=true;document.getElementById('submitted-result').hidden=true;frame.hidden=false;next.disabled=true;
-    frame.src=`preload_none_video.html?view=player&chapterId=local-preload&courseId=local&empty=${params.get('empty')==='1'?'1':'0'}&delay=${Number(params.get('delay')||0)}`;
+    frame.src=`preload_none_video.html?view=player&chapterId=local-preload&courseId=local&empty=${params.get('empty')==='1'?'1':'0'}&lazy=${params.get('lazy')==='1'?'1':'0'}&mixed=${params.get('mixed')==='1'?'1':'0'}&delay=${Number(params.get('delay')||0)}`;
   });
   addEventListener('message',event=>{
-    if(event.origin===location.origin&&event.data?.source==='preload-none-local-video'&&event.data.type==='ended')next.disabled=false;
+    if(event.origin===location.origin&&event.data?.source==='preload-none-local-video'
+      &&(event.data.type==='document-ended'||(event.data.type==='ended'&&params.get('mixed')!=='1')))next.disabled=false;
   });
 }
 </script></body></html>
