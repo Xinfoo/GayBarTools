@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import AppSettings
 from .cookies import CookieStore, CookieStoreError
 from .isolation import IsolationError, prepare_browser_executable
-from .models import Answer, Option, Question
+from .models import Answer, Option, Question, VideoQuizSolver
 from .paths import AppPaths
 
 
@@ -72,7 +72,7 @@ _VIDEO_QUESTION_BLOCKS = _QUESTION_BLOCKS + (".tk_topic", ".tkTopic", ".videoqui
 _VIDEO_TITLES = _QUESTION_TITLES + ", .tk_title, .tk-title, .tkTopic_title, .topic-title"
 _VIDEO_OPTIONS = (".tkitem, .tkItem, .tk-item, .tk-option, .videoquiz-options > li",) + _OPTION_SELECTORS
 _VIDEO_CONTINUE = re.compile(r"^(?:继续学习|继续播放|返回视频)$")
-_VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)")
+_VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)|(?:真|很)遗憾[，,\s]*再接再厉")
 _VIDEO_RIGHT = re.compile(r"恭喜.*(?:答对|正确)|(?:回答|答案|作答)正确|答对了")
 
 
@@ -82,6 +82,7 @@ def _clean(value: str) -> str:
 
 class BrowserSession:
     VIDEO_QUIZ_WAIT_TIMEOUT = 15.0
+    MAX_VIDEO_QUIZ_CORRECTIONS = 5
     VIDEO_START_TIMEOUT = 15.0
     PAUSED_QUIZ_GRACE = 1.0
     VIDEO_QUIZ_POLL_INTERVAL = 0.2
@@ -1098,7 +1099,7 @@ class BrowserSession:
         return sorted(unique.values(), key=lambda task: task.order)
 
     def process_content(self, *,
-                        on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None,
+                        on_quiz: VideoQuizSolver | None = None,
                         on_task: Callable[[str, int, int], None] | None = None) -> int:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
@@ -1294,7 +1295,7 @@ class BrowserSession:
         self._page.mouse.click(x, y, delay=random.uniform(65, 140))
         self._delay()
 
-    def watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+    def watch_video(self, on_quiz: VideoQuizSolver | None = None) -> None:
         try:
             self._watch_video(on_quiz)
         except Exception:
@@ -1569,8 +1570,44 @@ class BrowserSession:
             if self._selected(control) is not desired:
                 raise BrowserError("无法确认视频弹题选项已正确选中。")
 
+    @staticmethod
+    def _watch_video_feedback(root: Any, lines: list[str]) -> Any:
+        """Observe feedback rendering without changing the page or its answers."""
+        return root.evaluate_handle(r"""(root, lines) => {
+            const clean=s=>(s||'').replace(/\s+/g,' ').trim();
+            const matches=n=>n&&lines.some(line=>clean(n.textContent).includes(line));
+            const labels=[...root.querySelectorAll('*')].filter(n=>matches(n)
+                && ![...n.children].some(matches));
+            const visible=n=>{
+                if(!n.isConnected||!n.getClientRects().length)return false;
+                for(let e=n;e;e=e.parentElement){const s=getComputedStyle(e);
+                    if(e.hidden||s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)return false;}
+                return true;
+            };
+            const visibility=new Map(labels.map(n=>[n,visible(n)]));
+            const state={changed:false};
+            const inspect=records=>{
+                for(const m of records){
+                    if(m.type==='childList' && [...m.addedNodes,...m.removedNodes].some(matches))state.changed=true;
+                    if(m.type==='characterData' && (matches(m.target)
+                        || lines.some(line=>clean(m.oldValue).includes(line))))state.changed=true;
+                    if(m.type==='attributes')for(const n of labels){
+                        if(m.target!==n&&(n.parentElement===root||m.target!==n.parentElement))continue;
+                        const current=visible(n);
+                        if(current!==visibility.get(n))state.changed=true;
+                        visibility.set(n,current);
+                    }
+                }
+            };
+            state.observer=new MutationObserver(inspect);
+            state.observer.observe(root,{childList:true,subtree:true,characterData:true,
+                characterDataOldValue:true,attributes:true,attributeFilter:['hidden','style','class']});
+            state.read=()=>{inspect(state.observer.takeRecords());return state.changed;};
+            return state;
+        }""", lines)
+
     def _handle_video_quiz(self, root: Any, video: Any,
-                           on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None) -> None:
+                           on_quiz: VideoQuizSolver | None) -> None:
         self._guard()
         if on_quiz is None:
             raise BrowserError("视频出现答题界面，请启动带模型解题的自动流程。")
@@ -1579,49 +1616,104 @@ class BrowserSession:
             questions = self._extract_questions([root], video=video)
             if not questions:
                 raise BrowserError("视频弹题没有可识别的选择题，请查看诊断截图。")
-            fingerprint = self._question_fingerprint(questions)
             original_lines = {_clean(line) for line in root.inner_text(timeout=1500).splitlines()}
-            screenshot = self._video_quiz_screenshot(root, video) if self.settings.vision or self.settings.ocr else None
-            self.log(f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
-            answers = on_quiz(questions, screenshot)
-            self._guard()
-            current = self._extract_questions([root], video=video)
-            self._check_stop()
-            if self._question_fingerprint(current) != fingerprint:
-                raise BrowserError("模型回答期间视频弹题发生变化，已停止以免填写旧答案。")
-            self._apply_video_answers(answers, root, video)
-            deadline = time.monotonic() + self.VIDEO_QUIZ_WAIT_TIMEOUT
-            submitted = continued = False
-            while time.monotonic() < deadline:
+            # Restarting on an already rejected answer must also allow recovery.
+            # A phrase quoted in the question itself is not result feedback.
+            option_texts = {_clean(option.text) for q in questions for option in q.options}
+            existing_wrong = [line for line in original_lines if _VIDEO_WRONG.search(line)
+                              and not any(line in _clean(q.text) or _clean(q.text) in line for q in questions)
+                              and re.sub(r"^[A-Ha-h](?:[.、．:：)）\s]|$)\s*", "", line) not in option_texts]
+            original_lines.difference_update(existing_wrong)
+            corrections, correction_feedback = 0, None
+
+            def correction_note(previous: list[Answer], feedback: str, round_number: int) -> str:
+                return json.dumps({"correction_round": round_number,
+                    "previous_answers": [{"question_id": a.question_id, "choices": list(a.choices)} for a in previous],
+                    "feedback": feedback[:6000]}, ensure_ascii=False)
+
+            if existing_wrong:
+                previous = [Answer(q.id, tuple(label for label, control in self._question_controls[q.id].items()
+                                              if self._selected(control))) for q in questions]
+                corrections = 1
+                correction_feedback = correction_note(previous, "\n".join(existing_wrong), corrections)
+
+            while True:
                 self._guard()
-                active = bool(self._video_question_blocks(root, video))
-                state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
-                text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
-                feedback = " ".join(_clean(line) for line in text.splitlines() if _clean(line) not in original_lines)
-                if submitted and _VIDEO_WRONG.search(feedback):
-                    raise BrowserError("视频弹题答案未通过，已保留当前页面，请检查题目。")
-                continuation = self._text_control(_VIDEO_CONTINUE, root=root, video_quiz=True) if self._video_visible(root) else None
-                submit = self._text_control(_SUBMIT, root=root, video_quiz=True) if not submitted and active else None
-                if (continuation is not None and not continued
-                        and (submitted or _VIDEO_RIGHT.search(feedback) or submit is None)):
-                    self._click(continuation)
-                    continued = True
-                elif continuation is None and not active and (not state["paused"] or state["ended"]):
-                    self.log("视频弹题已处理，播放器已恢复。")
-                    return
-                elif submit is not None:
-                    current = self._extract_questions([root], video=video)
-                    self._check_stop()
-                    if current and self._question_fingerprint(current) != fingerprint:
-                        raise BrowserError("提交前视频弹题发生变化，已停止以免提交未经解答的题目。")
-                    if not current:
+                fingerprint = self._question_fingerprint(questions)
+                screenshot = (self._video_quiz_screenshot(root, video)
+                              if correction_feedback or self.settings.vision or self.settings.ocr else None)
+                self.log(f"正在纠正视频插题（{corrections}/{self.MAX_VIDEO_QUIZ_CORRECTIONS}）。"
+                         if correction_feedback else f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
+                answers = (on_quiz(questions, screenshot, video_quiz_feedback=correction_feedback)
+                           if correction_feedback else on_quiz(questions, screenshot))
+                self._guard()
+                current = self._extract_questions([root], video=video)
+                self._check_stop()
+                if self._question_fingerprint(current) != fingerprint:
+                    raise BrowserError("模型回答期间视频弹题发生变化，已停止以免填写旧答案。")
+                self._apply_video_answers(answers, root, video)
+                deadline = time.monotonic() + self.VIDEO_QUIZ_WAIT_TIMEOUT
+                submitted = continued = False
+                feedback_watch = None
+                try:
+                    while True:
+                        self._guard()
+                        active = bool(self._video_question_blocks(root, video))
+                        state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
+                        text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
+                        feedback_lines = [_clean(line) for line in text.splitlines() if _clean(line) not in original_lines]
+                        feedback = "\n".join(feedback_lines)
+                        expired = time.monotonic() >= deadline
+                        wrong = submitted and bool(_VIDEO_WRONG.search(feedback))
+                        if wrong:
+                            # Old red text may remain while a new submission is
+                            # pending. Only a fresh rendering (or the full result
+                            # wait) counts as another rejected submission.
+                            fresh = feedback_watch is None or feedback_watch.evaluate("s => s.read()")
+                            if not fresh and not expired:
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            if corrections >= self.MAX_VIDEO_QUIZ_CORRECTIONS:
+                                raise BrowserError(f"视频插题已纠错 {corrections} 次仍未通过，已保留当前页面。")
+                            corrections += 1
+                            correction_feedback = correction_note(answers, feedback, corrections)
+                            questions = self._extract_questions([root], video=video)
+                            if not questions:
+                                raise BrowserError("答错后未能重新读取视频插题，请查看当前页面。")
+                            break
+                        if expired:
+                            raise BrowserError("视频弹题未能通过或未恢复播放，请检查当前题目。")
+                        continuation = self._text_control(_VIDEO_CONTINUE, root=root, video_quiz=True) if self._video_visible(root) else None
+                        submit = self._text_control(_SUBMIT, root=root, video_quiz=True) if not submitted and active else None
+                        if (continuation is not None and not continued
+                                and (submitted or _VIDEO_RIGHT.search(feedback) or submit is None)):
+                            self._click(continuation)
+                            continued = True
+                        elif continuation is None and not active and (not state["paused"] or state["ended"]):
+                            self.log("视频弹题已处理，播放器已恢复。")
+                            return
+                        elif submit is not None:
+                            current = self._extract_questions([root], video=video)
+                            self._check_stop()
+                            if current and self._question_fingerprint(current) != fingerprint:
+                                raise BrowserError("提交前视频弹题发生变化，已停止以免提交未经解答的题目。")
+                            if not current:
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            old_wrong = [line for line in feedback_lines if _VIDEO_WRONG.search(line)]
+                            if old_wrong:
+                                feedback_watch = self._watch_video_feedback(root, old_wrong)
+                            self._click(submit)
+                            submitted = True
                         self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-                        continue
-                    self._click(submit)
-                    submitted = True
-                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-            self._check_stop()
-            raise BrowserError("视频弹题未能通过或未恢复播放，请检查当前题目；不会重复提交或跳过视频。")
+                finally:
+                    if feedback_watch is not None:
+                        try:
+                            feedback_watch.evaluate("s => s.observer.disconnect()")
+                        except Exception:
+                            pass  # A closed/replaced frame already removed it.
+                        finally:
+                            feedback_watch.dispose()
         finally:
             self._questions, self._question_controls = old_questions, old_controls
 
@@ -1645,11 +1737,11 @@ class BrowserSession:
         except Exception:
             self.log("停止后未能确认播放器暂停，请手动检查浏览器。")
 
-    def _watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+    def _watch_video(self, on_quiz: VideoQuizSolver | None = None) -> None:
         self._watch_video_targets(self._video_locators(), on_quiz)
 
     def _watch_video_targets(self, videos: list[Any],
-                             on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+                             on_quiz: VideoQuizSolver | None = None) -> None:
         self._guard()
         if not videos:
             raise BrowserError("未找到可见的视频播放器。")

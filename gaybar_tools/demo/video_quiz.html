@@ -28,8 +28,13 @@ document.querySelector('[data-question-id="outside-must-not-answer"]').addEventL
 function current(){return metrics.questions[active];}
 function showQuestion(){
   active=shown++;
-  metrics.questions.push({index:active,id:'reused-video-question',inputClicks:0,submitClicks:0,continueClicks:0,trusted:[],resolved:false,shownAt:video.currentTime});
+  metrics.questions.push({index:active,id:'reused-video-question',inputClicks:0,submitClicks:0,continueClicks:0,trusted:[],resolved:false,shownAt:video.currentTime,submissions:[]});
   popup.querySelector('.Zy_TItle').textContent=active===0?'【判断题】视频中的第一道题：保护账号密码是正确的。':'【判断题】视频中的第二道题：随意公开账号密码是正确的。';
+  if(mode==='correction-multiple'){
+    popup.querySelector('.Zy_TItle').textContent='【多选题】视频中的插题：选择应当保密的信息。';
+    popup.querySelectorAll('input').forEach(input=>input.type='checkbox');
+    popup.querySelectorAll('label span').forEach((label,index)=>label.textContent=index===0?'A. 账号密码':'B. 公开网页地址');
+  }
   popup.querySelectorAll('input').forEach(input=>input.checked=mode==='preselected'&&input.value==='A');
   popup.querySelector('.TiMu').hidden=false;submit.hidden=false;resume.hidden=true;result.textContent='';popup.hidden=false;video.pause();persist();
 }
@@ -50,9 +55,23 @@ popup.addEventListener('change',event=>{
 });
 submit.addEventListener('click',event=>{
   current().submitClicks++;current().trusted.push(event.isTrusted);
-  const selected=popup.querySelector('input:checked');
-  if(!selected||selected.value!=='A'||mode==='wrong'){result.textContent='回答错误，请重新作答';persist();return;}
-  current().correct=true;submit.hidden=true;resume.hidden=false;result.textContent='回答正确！请点击继续学习。';persist();
+  const selected=Array.from(popup.querySelectorAll('input:checked'),input=>input.value);
+  current().submissions.push(selected);persist();
+  const respond=()=>{
+    if(selected.length!==1||selected[0]!=='A'||mode==='wrong'){
+      // Real feedback can leave the same question and Submit control visible.
+      result.textContent='真遗憾，再接再厉！';persist();return;
+    }
+    current().correct=true;submit.hidden=true;resume.hidden=false;result.textContent='回答正确！请点击继续学习。';persist();
+  };
+  // Keep the previous wrong feedback visible while the next response is pending.
+  // The client must not treat it as rejection of an unprocessed new submission.
+  if(mode==='correction-delayed'&&current().submitClicks>1){
+    submit.disabled=true;
+    result.classList.add('pending');
+    setTimeout(()=>{submit.disabled=false;result.classList.remove('pending');respond();},800);
+  }
+  else respond();
 });
 resume.addEventListener('click',event=>{current().continueClicks++;current().trusted.push(event.isTrusted);finishQuestion();});
 video.addEventListener('ended',()=>{metrics.ended=true;metrics.currentTime=video.currentTime;metrics.elapsed=(performance.now()-startedAt)/1000;document.getElementById('video-status').textContent='视频已自然播放完成';document.querySelector('[data-question-id="outside-must-not-answer"]').hidden=true;document.querySelector('iframe').remove();document.getElementById('next-chapter').disabled=false;persist();});
