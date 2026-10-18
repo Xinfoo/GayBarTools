@@ -1216,31 +1216,46 @@ class BrowserSession:
         """
         tokens = []
         if kind in {"video", "document", "mixed"}:
-            videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
-            roots = videos + self._document_targets() + self._chapter_quiz_targets()
+            try:
+                videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
+                roots = videos + self._document_targets() + self._chapter_quiz_targets()
+            except BrowserError:
+                raise
+            except Exception:
+                roots = []
         elif kind == "quiz":
             roots = []
             for frame in self._frames():
-                if not self._frame_visible_memo(frame):
+                try:
+                    if not self._frame_visible_memo(frame):
+                        continue
+                    if self._question_blocks(frame) or self._frame_result_visible(frame):
+                        tokens.append((id(frame), frame.evaluate("performance.timeOrigin")))
+                except BrowserError:
+                    raise
+                except Exception:
                     continue
-                if self._question_blocks(frame) or self._frame_result_visible(frame):
-                    tokens.append((id(frame), frame.evaluate("performance.timeOrigin")))
         else:
             roots = []
         for root in roots:
-            handle = root.element_handle(timeout=1000)
-            if handle is None:
-                continue
             try:
-                frame = handle.owner_frame()
-                if frame is not None:
-                    # Blob URLs are ephemeral and excluded from the stable
-                    # visited key. Their replacement is useful navigation
-                    # evidence for SPA players that keep the same document.
-                    resource = root.evaluate("e => e.tagName==='VIDEO' ? (e.currentSrc || e.getAttribute('src') || '') : ''")
-                    tokens.append((id(frame), frame.evaluate("performance.timeOrigin"), resource))
-            finally:
-                handle.dispose()
+                handle = root.element_handle(timeout=1000)
+                if handle is None:
+                    continue
+                try:
+                    frame = handle.owner_frame()
+                    if frame is not None:
+                        # Blob URLs are ephemeral and excluded from the stable
+                        # visited key. Their replacement is useful navigation
+                        # evidence for SPA players that keep the same document.
+                        resource = root.evaluate("e => e.tagName==='VIDEO' ? (e.currentSrc || e.getAttribute('src') || '') : ''")
+                        tokens.append((id(frame), frame.evaluate("performance.timeOrigin"), resource))
+                finally:
+                    handle.dispose()
+            except BrowserError:
+                raise
+            except Exception:
+                continue
         return tuple(sorted(set(tokens)))
 
     def _video_locators(self, *, include_occluded: bool = False) -> list[Any]:
@@ -1428,7 +1443,12 @@ class BrowserSession:
         return bool(state and (state["completed"] or not state["required"]) and state["kind"] == "video")
 
     def _task_region_info(self, target: Any, *, placeholder: bool = False) -> dict[str, Any] | None:
-        owner = self._task_region(target)
+        try:
+            owner = self._task_region(target)
+        except BrowserError:
+            raise
+        except Exception:
+            return None
         if owner is None:
             return None
         region, frame = owner
@@ -1516,6 +1536,13 @@ class BrowserSession:
                 retained = True
             return {"completed": state["completed"], "required": state["required"],
                     "kind": state["kind"], "descriptor": descriptor}
+        except BrowserError:
+            raise
+        except Exception:
+            # The attachment card or its frame disappeared while it was being
+            # inspected. Treat it as unowned for this scan; the next discovery
+            # pass reads the current DOM.
+            return None
         finally:
             if not retained:
                 region.dispose()
@@ -1533,8 +1560,13 @@ class BrowserSession:
             candidates = [(old, identity) for owner, stamp, old, identity in self._content_nodes
                           if owner is frame and stamp == origin and identity.startswith(kind + ":")]
             if candidates:
-                index = handle.evaluate("(e,nodes) => nodes.findIndex(node => node===e)",
-                                        [old for old, _identity in candidates])
+                try:
+                    index = handle.evaluate("(e,nodes) => nodes.findIndex(node => node===e)",
+                                            [old for old, _identity in candidates])
+                except Exception:
+                    # Retained handles from a replaced document cannot be
+                    # compared; issue a fresh identity for the current node.
+                    index = -1
                 if index >= 0:
                     return candidates[index][1]
             self._content_sequence += 1
@@ -1733,19 +1765,39 @@ class BrowserSession:
         return rows, submitted or ready
 
     def _unpublished_quiz(self, target: Any) -> bool:
-        owner = self._task_region(target)
+        try:
+            owner = self._task_region(target)
+        except BrowserError:
+            raise
+        except Exception:
+            owner = None
         if owner is not None:
             region, _frame = owner
             try:
                 if re.search(r"教师.{0,8}(?:未创建|未完成|尚未发布)|测验尚未发布",
                              region.evaluate("e => e.innerText || ''")):
                     return True
+            except BrowserError:
+                raise
+            except Exception:
+                pass
             finally:
                 region.dispose()
-        for root in self._quiz_roots_for(target):
-            body = root if getattr(root, "element_handle", None) is not None else root.locator("body")
-            if re.search(r"教师.{0,8}(?:未创建|未完成|尚未发布)|测验尚未发布", body.inner_text(timeout=1500)):
-                return True
+        try:
+            roots = self._quiz_roots_for(target)
+        except BrowserError:
+            raise
+        except Exception:
+            roots = []
+        for root in roots:
+            try:
+                body = root if getattr(root, "element_handle", None) is not None else root.locator("body")
+                if re.search(r"教师.{0,8}(?:未创建|未完成|尚未发布)|测验尚未发布", body.inner_text(timeout=1500)):
+                    return True
+            except BrowserError:
+                raise
+            except Exception:
+                continue
         return False
 
     def content_tasks(self, *, include_occluded: bool = False,
@@ -1789,12 +1841,10 @@ class BrowserSession:
                 except BrowserError:
                     raise
                 except Exception:
-                    # A fast navigation click can replace the document while
-                    # this poll is still reading the old frame. That target is
-                    # no longer part of the page; retry on the next poll.
-                    if self._navigation_mode:
-                        continue
-                    raise
+                    # A target can disappear during a navigation click or a
+                    # same-document replacement. Drop it; the next scan sees
+                    # the current DOM instead of stopping the workflow.
+                    continue
         known_regions = {task.region for task in tasks if task.region}
         for frame in self._frames():
             try:
@@ -1816,9 +1866,7 @@ class BrowserSession:
             except BrowserError:
                 raise
             except Exception:
-                if self._navigation_mode:
-                    continue
-                raise
+                continue
         # A real DOM node can be reached through more than one reader selector.
         unique = {task.identity: task for task in tasks}
         return sorted(unique.values(), key=lambda task: task.order)
@@ -2493,8 +2541,18 @@ class BrowserSession:
                     while True:
                         self._guard()
                         active = bool(self._video_question_blocks(root, video))
-                        state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
-                        text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
+                        try:
+                            state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
+                        except BrowserError:
+                            raise
+                        except Exception:
+                            raise BrowserError("视频播放器已发生变化，请检查当前页面。") from None
+                        try:
+                            text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
+                        except BrowserError:
+                            raise
+                        except Exception:
+                            text = ""
                         feedback_lines = [_clean(line) for line in text.splitlines() if _clean(line) not in original_lines]
                         feedback = "\n".join(feedback_lines)
                         expired = time.monotonic() >= deadline
@@ -2503,7 +2561,12 @@ class BrowserSession:
                             # Old red text may remain while a new submission is
                             # pending. Only a fresh rendering (or the full result
                             # wait) counts as another rejected submission.
-                            fresh = feedback_watch is None or feedback_watch.evaluate("s => s.read()")
+                            fresh = True
+                            if feedback_watch is not None:
+                                try:
+                                    fresh = bool(feedback_watch.evaluate("s => s.read()"))
+                                except Exception:
+                                    fresh = True
                             if not fresh and not expired:
                                 self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
                                 continue
@@ -3061,8 +3124,16 @@ class BrowserSession:
             result = any(self._quiz_probe(frame)["rows"] for frame in self._frames()
                          if self._frame_visible_memo(frame))
         else:
-            result = any(self._question_blocks(frame) for frame in self._frames()
-                         if self._frame_visible_memo(frame))
+            result = False
+            for frame in self._frames():
+                try:
+                    if self._frame_visible_memo(frame) and self._question_blocks(frame):
+                        result = True
+                        break
+                except BrowserError:
+                    raise
+                except Exception:
+                    continue
         if self._navigation_mode:
             self._nav_has_quiz = result
         return result
@@ -3356,7 +3427,13 @@ class BrowserSession:
             cached = self._nav_result_visible.get(key)
             if cached is not None:
                 return cached
-        result = any(self._result_probe_cached(frame) for frame in self._quiz_roots())
+        try:
+            roots = self._quiz_roots()
+        except BrowserError:
+            raise
+        except Exception:
+            roots = self._frames()
+        result = any(self._result_probe_cached(frame) for frame in roots)
         if self._navigation_mode:
             self._nav_result_visible[id(self._quiz_target)] = result
         return result
@@ -3445,7 +3522,13 @@ class BrowserSession:
         if self._result_visible():
             return True
         submit = None
-        for root in self._quiz_roots():
+        try:
+            roots = self._quiz_roots()
+        except BrowserError:
+            raise
+        except Exception:
+            roots = self._frames()
+        for root in roots:
             submit = self._text_control(_SUBMIT, root=root)
             if submit is not None:
                 break
@@ -3461,21 +3544,33 @@ class BrowserSession:
                 if self._result_visible():
                     self.log("已确认测验提交结果。")
                     return True
-                for frame in self._quiz_dialog_roots():
-                    dialogs = frame.locator("[role=dialog], .layui-layer, .layui-layer-dialog, .ant-modal, .el-message-box, .confirm-dialog, .popDiv")
-                    for index in range(min(dialogs.count(), 15)):
-                        dialog = dialogs.nth(index)
-                        if not self._visible(dialog):
-                            continue
-                        text = _clean(dialog.inner_text(timeout=1000))
-                        if re.search(r"未作答|漏答|尚未完成|还有.*未答", text):
-                            raise BrowserError("网页提示仍有题目未作答，已停止提交。")
-                        if re.search(r"提交|交卷", text) and not confirmation_clicked:
-                            confirm = self._text_control(re.compile(r"^(?:确定|确认|确认提交|确定提交|提交)$"), root=dialog)
-                            if confirm is None:
-                                raise BrowserError("提交确认框中没有可识别的确认按钮。")
-                            self._click(confirm)
-                            confirmation_clicked = True
+                try:
+                    dialog_roots = self._quiz_dialog_roots()
+                except BrowserError:
+                    raise
+                except Exception:
+                    self._wait(0.3)
+                    continue
+                for frame in dialog_roots:
+                    try:
+                        dialogs = frame.locator("[role=dialog], .layui-layer, .layui-layer-dialog, .ant-modal, .el-message-box, .confirm-dialog, .popDiv")
+                        for index in range(min(dialogs.count(), 15)):
+                            dialog = dialogs.nth(index)
+                            if not self._visible(dialog):
+                                continue
+                            text = _clean(dialog.inner_text(timeout=1000))
+                            if re.search(r"未作答|漏答|尚未完成|还有.*未答", text):
+                                raise BrowserError("网页提示仍有题目未作答，已停止提交。")
+                            if re.search(r"提交|交卷", text) and not confirmation_clicked:
+                                confirm = self._text_control(re.compile(r"^(?:确定|确认|确认提交|确定提交|提交)$"), root=dialog)
+                                if confirm is None:
+                                    raise BrowserError("提交确认框中没有可识别的确认按钮。")
+                                self._click(confirm)
+                                confirmation_clicked = True
+                    except BrowserError:
+                        raise
+                    except Exception:
+                        continue
                 self._wait(0.3)
             raise BrowserError("提交后没有检测到明确的成功结果，请人工确认，程序不会重复提交。")
         finally:
@@ -3611,10 +3706,19 @@ class BrowserSession:
             if warning is not None:
                 candidate, candidate_since, departed_since = None, 0.0, 0.0
                 if not warning_confirmed:
-                    if re.search(r"(?:^|\s)(?:disabled|disable)(?:\s|$)", warning.get_attribute("class") or ""):
-                        raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
-                    self.log("检测到未完成任务点提示，点击提示框内的下一节。")
-                    self._click(warning, humanized=False)
+                    try:
+                        if re.search(r"(?:^|\s)(?:disabled|disable)(?:\s|$)", warning.get_attribute("class") or ""):
+                            raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
+                        self.log("检测到未完成任务点提示，点击提示框内的下一节。")
+                        self._click(warning, humanized=False)
+                    except BrowserError:
+                        raise
+                    except Exception:
+                        transient_errors += 1
+                        if transient_errors >= 8:
+                            raise
+                        self._wait(0.1)
+                        continue
                     warning_confirmed = True
                     deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
                 self._wait(0.25)
@@ -3655,6 +3759,11 @@ class BrowserSession:
                 elif time.monotonic() - candidate_since >= self.NEXT_PAGE_SETTLE:
                     self._question_controls.clear()
                     self._questions.clear()
+                    # Handles from the old document are no longer safe to
+                    # compare or evaluate once the transition is accepted.
+                    self._clear_content_nodes()
+                    self._clear_task_regions()
+                    self._quiz_view_rows.clear()
                     self._chapter_page_selected = True
                     self.log("已进入下一学习页面。")
                     return True
