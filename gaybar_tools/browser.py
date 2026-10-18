@@ -1,7 +1,8 @@
 """Synchronous, conservative Playwright adapter for visible chapter controls.
 
-JavaScript inspects DOM and media state; it never changes media position, speed,
-answers, or task flags. A session belongs to the worker thread that launched it.
+JavaScript inspects DOM/media state and filters pointer exits during video work;
+it never changes media position, speed, answers, or task flags. A session belongs
+to the worker thread that launched it.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import random
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -75,6 +77,23 @@ _VIDEO_CONTINUE = re.compile(r"^(?:继续学习|继续播放|返回视频)$")
 _VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)|(?:真|很)遗憾[，,\s]*再接再厉")
 _VIDEO_RIGHT = re.compile(r"恭喜.*(?:答对|正确)|(?:回答|答案|作答)正确|答对了")
 
+# Registered before page scripts, but inert outside the current video scope.
+# Keep native event APIs, focus/visibility state and media methods untouched.
+_POINTER_EXIT_BOOTSTRAP = """key => {
+    const slot = Symbol.for(key);
+    if (Object.prototype.hasOwnProperty.call(window, slot)) return;
+    let active = false;
+    const boundary = event => {
+        if (active && event.isTrusted && event.relatedTarget === null
+            && (event.type.startsWith('mouse') || event.pointerType === 'mouse'))
+            event.stopImmediatePropagation();
+    };
+    for (const type of ['mouseout', 'mouseleave', 'pointerout', 'pointerleave'])
+        window.addEventListener(type, boundary, {capture: true});
+    Object.defineProperty(window, slot, {configurable: true,
+        value: {setActive: value => {active = value === true;}}});
+}"""
+
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
@@ -102,6 +121,8 @@ class BrowserSession:
         self._content_nodes: list[tuple[Any, float, Any, str]] = []
         self._content_sequence = 0
         self._task_regions: list[dict[str, Any]] = []
+        self._pointer_guard_key = secrets.token_hex(24)
+        self._pointer_guards: list[tuple[Any, float, Any]] = []
         self._owner_thread: int | None = None
         self._mouse = (0.0, 0.0)
         self._unexpected_dialog = ""
@@ -329,6 +350,7 @@ class BrowserSession:
                 options["executable_path"] = executable
                 self._context = self._playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.paths.profile), **options)
+            self._context.add_init_script(self._pointer_guard_script())
             self._context.set_default_timeout(5000)
             self._context.set_default_navigation_timeout(20000)
             self._restore_login_state()
@@ -1323,6 +1345,82 @@ class BrowserSession:
             raise BrowserError("无法确定视频所在页面。")
         return frame
 
+    def _pointer_guard_script(self) -> str:
+        return f"({_POINTER_EXIT_BOOTSTRAP})({json.dumps(self._pointer_guard_key)});"
+
+    @staticmethod
+    def _release_pointer_guard(handle: Any) -> None:
+        try:
+            handle.evaluate("guard => guard.setActive(false)")
+        except Exception:
+            pass  # Navigation/closing already destroyed this document.
+        finally:
+            try:
+                handle.dispose()
+            except Exception:
+                pass
+
+    def _clear_pointer_guards(self) -> None:
+        guards, self._pointer_guards = self._pointer_guards, []
+        for _, _, handle in guards:
+            self._release_pointer_guard(handle)
+
+    def _pointer_guard(self, frame: Any) -> Any:
+        origin = frame.evaluate("performance.timeOrigin")
+        kept = []
+        current = None
+        for owner, stamp, handle in self._pointer_guards:
+            if owner.is_detached() or (owner is frame and stamp != origin):
+                self._release_pointer_guard(handle)
+            else:
+                kept.append((owner, stamp, handle))
+                if owner is frame:
+                    current = handle
+        self._pointer_guards = kept
+        if current is not None:
+            return current
+        # The handoff uses a random, non-enumerable symbol, removed as soon as
+        # Python owns the handle. No fixed automation global or control events.
+        current = frame.evaluate_handle("""key => {
+            const slot = Symbol.for(key), guard = window[slot];
+            delete window[slot];
+            return guard;
+        }""", self._pointer_guard_key)
+        if current.evaluate("guard => guard === undefined"):
+            current.dispose()
+            # Existing about:blank/restored documents may predate add_init_script.
+            frame.evaluate(self._pointer_guard_script())
+            current = frame.evaluate_handle("""key => {
+                const slot = Symbol.for(key), guard = window[slot];
+                delete window[slot];
+                return guard;
+            }""", self._pointer_guard_key)
+        self._pointer_guards.append((frame, origin, current))
+        return current
+
+    @contextmanager
+    def _video_pointer_scope(self, video: Any) -> Iterator[None]:
+        active = []
+        try:
+            if self._context is not None:
+                try:
+                    frame = self._video_frame(video)
+                    while frame is not None:
+                        guard = self._pointer_guard(frame)
+                        guard.evaluate("guard => guard.setActive(true)")
+                        active.append(guard)
+                        frame = frame.parent_frame
+                except Exception:
+                    # A compatibility aid must not introduce a new blocker.
+                    self.log("未能启用部分页面的鼠标移出兼容，将沿用正常播放恢复流程。")
+            yield
+        finally:
+            for guard in reversed(active):
+                try:
+                    guard.evaluate("guard => guard.setActive(false)")
+                except Exception:
+                    pass  # A replaced frame no longer has an active listener.
+
     def _video_visible(self, locator: Any, *, player: bool = False, include_occluded: bool = False) -> bool:
         """Exclude retired player regions without hiding below-fold quiz rows."""
         self._check_stop()
@@ -1747,67 +1845,68 @@ class BrowserSession:
             raise BrowserError("未找到可见的视频播放器。")
         deadline = time.monotonic() + float(self.settings.video_timeout)
         for number, video in enumerate(videos, start=1):
-            self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
-            last_position, progressed_at, play_requested_at = -1.0, time.monotonic(), 0.0
-            paused_since = 0.0
-            while True:
-                self._guard()
-                if time.monotonic() > deadline:
-                    raise BrowserError("视频等待超时，请检查播放器或网络。")
-                try:
-                    state = video.evaluate("""v => ({ended:v.ended, paused:v.paused,
-                        time:v.currentTime, duration:Number.isFinite(v.duration)?v.duration:0,
-                        rate:v.playbackRate, error:v.error?v.error.message:null})""")
-                except Exception as exc:
-                    raise BrowserError("视频播放器已发生变化，请确认当前章节。") from exc
-                if state["error"]:
-                    raise BrowserError(f"播放器错误：{state['error']}")
-                if abs(float(state["rate"]) - 1) > 0.01:
-                    raise BrowserError("检测到视频播放速度不是 1 倍，请手动恢复后再开始。")
-                if state["paused"] or state["ended"]:
-                    prompt = self._find_video_quiz(video)
-                    if prompt is not None:
-                        started = time.monotonic()
-                        self._handle_video_quiz(prompt, video, on_quiz)
-                        self._check_stop()
-                        # Model/OCR work is not buffering time or playback time.
-                        deadline += time.monotonic() - started
-                        progressed_at, play_requested_at, paused_since = time.monotonic(), 0.0, 0.0
-                        continue
-                if state["ended"]:
-                    self.log("视频已自然播放结束。")
-                    break
-                position = float(state["time"])
-                if position > last_position + 0.15:
-                    progressed_at, last_position = time.monotonic(), position
-                if state["paused"]:
-                    if play_requested_at:
-                        if time.monotonic() - play_requested_at < self.VIDEO_START_TIMEOUT:
-                            # A preload-none player may still be loading after
-                            # the trusted click. Keep polling for prompts/stop
-                            # without toggling the play control a second time.
+            with self._video_pointer_scope(video):
+                self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
+                last_position, progressed_at, play_requested_at = -1.0, time.monotonic(), 0.0
+                paused_since = 0.0
+                while True:
+                    self._guard()
+                    if time.monotonic() > deadline:
+                        raise BrowserError("视频等待超时，请检查播放器或网络。")
+                    try:
+                        state = video.evaluate("""v => ({ended:v.ended, paused:v.paused,
+                            time:v.currentTime, duration:Number.isFinite(v.duration)?v.duration:0,
+                            rate:v.playbackRate, error:v.error?v.error.message:null})""")
+                    except Exception as exc:
+                        raise BrowserError("视频播放器已发生变化，请确认当前章节。") from exc
+                    if state["error"]:
+                        raise BrowserError(f"播放器错误：{state['error']}")
+                    if abs(float(state["rate"]) - 1) > 0.01:
+                        raise BrowserError("检测到视频播放速度不是 1 倍，请手动恢复后再开始。")
+                    if state["paused"] or state["ended"]:
+                        prompt = self._find_video_quiz(video)
+                        if prompt is not None:
+                            started = time.monotonic()
+                            self._handle_video_quiz(prompt, video, on_quiz)
+                            self._check_stop()
+                            # Model/OCR work is not buffering time or playback time.
+                            deadline += time.monotonic() - started
+                            progressed_at, play_requested_at, paused_since = time.monotonic(), 0.0, 0.0
+                            continue
+                    if state["ended"]:
+                        self.log("视频已自然播放结束。")
+                        break
+                    position = float(state["time"])
+                    if position > last_position + 0.15:
+                        progressed_at, last_position = time.monotonic(), position
+                    if state["paused"]:
+                        if play_requested_at:
+                            if time.monotonic() - play_requested_at < self.VIDEO_START_TIMEOUT:
+                                # A preload-none player may still be loading after
+                                # the trusted click. Keep polling for prompts/stop
+                                # without toggling the play control a second time.
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            raise BrowserError("点击播放后视频仍未开始，请检查播放器加载状态或页面提示。")
+                        if not paused_since:
+                            paused_since = time.monotonic()
+                        if time.monotonic() - paused_since < self.PAUSED_QUIZ_GRACE:
                             self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
                             continue
-                        raise BrowserError("点击播放后视频仍未开始，请检查播放器加载状态或页面提示。")
-                    if not paused_since:
-                        paused_since = time.monotonic()
-                    if time.monotonic() - paused_since < self.PAUSED_QUIZ_GRACE:
-                        self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-                        continue
-                    play = self._player_control(video,
-                        ".vjs-big-play-button, .vjs-play-control, button[aria-label*=Play], "
-                        "button[aria-label*=播放], [role=button][title=播放]")
-                    self._click(play if play is not None else video)
-                    play_requested_at = time.monotonic()
-                    self._wait(0.5)
-                elif time.monotonic() - progressed_at > 120:
-                    raise BrowserError("视频超过 120 秒没有进展，请检查缓冲或提示。")
-                else:
-                    paused_since, play_requested_at = 0.0, 0.0
-                if time.monotonic() - self._last_video_log > 30:
-                    self.log(f"视频进度 {int(position)} / {int(state['duration'])} 秒。")
-                    self._last_video_log = time.monotonic()
-                self._wait(max(0.25, float(self.settings.poll_interval)))
+                        play = self._player_control(video,
+                            ".vjs-big-play-button, .vjs-play-control, button[aria-label*=Play], "
+                            "button[aria-label*=播放], [role=button][title=播放]")
+                        self._click(play if play is not None else video)
+                        play_requested_at = time.monotonic()
+                        self._wait(0.5)
+                    elif time.monotonic() - progressed_at > 120:
+                        raise BrowserError("视频超过 120 秒没有进展，请检查缓冲或提示。")
+                    else:
+                        paused_since, play_requested_at = 0.0, 0.0
+                    if time.monotonic() - self._last_video_log > 30:
+                        self.log(f"视频进度 {int(position)} / {int(state['duration'])} 秒。")
+                        self._last_video_log = time.monotonic()
+                    self._wait(max(0.25, float(self.settings.poll_interval)))
 
     def _document_targets(self) -> list[Any]:
         # A reader's outer attachment/wrapper often never scrolls. Discover the
@@ -2599,6 +2698,7 @@ class BrowserSession:
             raise BrowserError("请在浏览器工作线程中关闭浏览器。")
         self._clear_content_nodes()
         self._clear_task_regions()
+        self._clear_pointer_guards()
         # Stop only cancels course actions. The last checkpoint must still run
         # before Chromium closes, while its session cookies remain readable.
         self._checkpoint_cookies(force=True)
