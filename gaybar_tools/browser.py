@@ -51,6 +51,7 @@ class ContentTask:
     completed: bool = False
     placeholder: bool = False
     region: str = ""
+    required: bool = True
 
 
 _CHAPTER_URL = re.compile(r"/(?:mycourse/studentstudy|knowledge/cards|studentstudy)(?:[/?]|$)", re.I)
@@ -649,7 +650,7 @@ class BrowserSession:
             for task in tasks:
                 if task.region:
                     parts.append(("task-region", task.kind, task.region))
-                    if task.completed:
+                    if task.completed or not task.required:
                         continue
                     if task.placeholder:
                         pending_ready[task.identity] = False
@@ -819,10 +820,10 @@ class BrowserSession:
         self._guard()
         videos = self._video_locators()
         if videos:
-            # A completed player can remain in the DOM after 下一节 loads a
-            # separate assessment. It must not mask the new questions. Keep
-            # unfinished playback and player-owned overlays in the video flow.
-            unfinished = [video for video in videos if not self.task_completed(video)]
+            # Completed/optional players must not mask a separate assessment.
+            # Keep pending playback and its overlays in the video flow.
+            unfinished = [video for video in videos
+                          if self.task_required(video) and not self.task_completed(video)]
             finished = all(video.evaluate("v => v.ended") for video in unfinished)
             if not finished or any(self._find_video_quiz(video) is not None for video in unfinished):
                 return "video"
@@ -882,8 +883,9 @@ class BrowserSession:
                        ||s.contentVisibility==='hidden'||Number(s.opacity)===0)return false;}
                 return true;
             };
-            const markers=[...card.querySelectorAll('.ans-job-icon')].filter(e=>
-                e.closest('.ans-attach-ct')===card&&visible(e));
+            const ownMarkers=[...card.querySelectorAll('.ans-job-icon')].filter(e=>
+                e.closest('.ans-attach-ct')===card);
+            const markers=ownMarkers.filter(visible);
             const labels=markers.flatMap(e=>[e.getAttribute('aria-label'),e.getAttribute('title'),
                 e.getAttribute('data-original-title'),e.innerText].map(s=>(s||'').replace(/\s+/g,' ').trim()));
             // Static PDF cards can paint an empty icon entirely through this
@@ -916,7 +918,7 @@ class BrowserSession:
                 }catch{return '';}
             }).filter(Boolean);
             const path=[];for(let n=card;n&&n.parentElement;n=n.parentElement)path.unshift([...n.parentElement.children].indexOf(n));
-            return {completed:completed&&!labels.includes('任务点未完成'),
+            return {required:ownMarkers.length>0, completed:completed&&!labels.includes('任务点未完成'),
                 kind:video?'video':quiz?'quiz':'document',ids,sources,path};
         }""")
 
@@ -935,9 +937,24 @@ class BrowserSession:
         state = self._task_marker_state(target)
         return bool(state and state["completed"])
 
-    def _completed_video_region(self, target: Any) -> bool:
+    def task_required(self, target: Any) -> bool:
         state = self._task_marker_state(target)
-        return bool(state and state["completed"] and state["kind"] == "video")
+        # Unknown layouts retain the existing adapter fallback. Only a known
+        # attachment without its own job icon confirms an optional resource.
+        return state is None or bool(state["required"])
+
+    def _task_skip_reason(self, target: Any) -> str:
+        state = self._task_marker_state(target)
+        if state is not None:
+            if not state["required"]:
+                return "未标记为任务点"
+            if state["completed"]:
+                return "任务点已完成"
+        return ""
+
+    def _inactive_video_region(self, target: Any) -> bool:
+        state = self._task_marker_state(target)
+        return bool(state and (state["completed"] or not state["required"]) and state["kind"] == "video")
 
     def _task_region_info(self, target: Any, *, placeholder: bool = False) -> dict[str, Any] | None:
         owner = self._task_region(target)
@@ -1024,7 +1041,8 @@ class BrowserSession:
                     "was_placeholder": placeholder, "outer": outer, "outer_known": outer_known,
                     "inner_known": inner_known})
                 retained = True
-            return {"completed": state["completed"], "kind": state["kind"], "descriptor": descriptor}
+            return {"completed": state["completed"], "required": state["required"],
+                    "kind": state["kind"], "descriptor": descriptor}
         finally:
             if not retained:
                 region.dispose()
@@ -1098,7 +1116,8 @@ class BrowserSession:
                 identity = self._content_identity(target, kind)
                 region = self._task_region_info(target)
                 tasks.append(ContentTask(kind, target, identity, self._content_order(target),
-                    completed=bool(region and region["completed"]), region=region["descriptor"] if region else ""))
+                    completed=bool(region and region["completed"]), region=region["descriptor"] if region else "",
+                    required=region["required"] if region else True))
         known_regions = {task.region for task in tasks if task.region}
         for frame in self._frames():
             if not self._frame_visible(frame):
@@ -1114,7 +1133,7 @@ class BrowserSession:
                 kind = region["kind"]
                 tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
                     self._content_order(anchor), completed=region["completed"], placeholder=True,
-                    region=region["descriptor"]))
+                    region=region["descriptor"], required=region["required"]))
                 known_regions.add(region["descriptor"])
         # A real DOM node can be reached through more than one reader selector.
         unique = {task.identity: task for task in tasks}
@@ -1126,6 +1145,7 @@ class BrowserSession:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
         completed: set[str] = set()
+        non_tasks: set[str] = set()
         executed = 0
         skipped = 0
         stable_end = 0
@@ -1134,14 +1154,25 @@ class BrowserSession:
             for _iteration in range(1200):
                 self._guard()
                 tasks = self.content_tasks()
+                # A lazy attachment may gain a job icon while another task is
+                # running. Revisit only resources skipped for having no icon,
+                # never replay work already executed or marked complete.
+                reopened = {task.identity for task in tasks
+                            if task.identity in non_tasks and task.required and not task.completed}
+                completed.difference_update(reopened)
+                non_tasks.difference_update(reopened)
+                skipped -= len(reopened)
                 pending = [task for task in tasks if task.identity not in completed]
                 if pending:
                     stable_end = 0
                     task = pending[0]
-                    if self.task_completed(task.target):
+                    skip_reason = self._task_skip_reason(task.target)
+                    if skip_reason:
                         completed.add(task.identity)
+                        if skip_reason == "未标记为任务点":
+                            non_tasks.add(task.identity)
                         skipped += 1
-                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        self.log(f"本区域{skip_reason}，跳过视频播放或静态阅读。")
                         continue
                     if self._unresolved_content(tasks, before=pending[0].order):
                         if not unresolved_since:
@@ -1160,11 +1191,14 @@ class BrowserSession:
                     unresolved_since = 0.0
                     number = executed + 1
                     if on_task is not None:
-                        on_task(task.kind, number, executed + sum(not item.completed for item in pending))
-                    if self.task_completed(task.target):
+                        on_task(task.kind, number, executed + sum(item.required and not item.completed for item in pending))
+                    skip_reason = self._task_skip_reason(task.target)
+                    if skip_reason:
                         completed.add(task.identity)
+                        if skip_reason == "未标记为任务点":
+                            non_tasks.add(task.identity)
                         skipped += 1
-                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        self.log(f"本区域{skip_reason}，跳过视频播放或静态阅读。")
                         continue
                     self.log(f"按页面顺序处理第 {number} 个任务：{'视频' if task.kind == 'video' else '静态阅读'}。")
                     if task.kind == "video":
@@ -1200,9 +1234,10 @@ class BrowserSession:
                     stable_end += 1
                 if stable_end >= 2:
                     final_tasks = self.content_tasks()
-                    if (not [task for task in final_tasks if task.identity not in completed]
+                    if (not [task for task in final_tasks if task.identity not in completed
+                             or (task.identity in non_tasks and task.required and not task.completed)]
                             and not self._unresolved_content(final_tasks)):
-                        self.log(f"本页学习任务已处理完毕：执行 {executed} 个，跳过已完成 {skipped} 个。")
+                        self.log(f"本页学习任务已处理完毕：执行 {executed} 个，跳过 {skipped} 个已完成或非任务区域。")
                         return executed
                     stable_end = 0
             raise BrowserError("页面持续出现新的学习任务，已停止以防无限循环。")
@@ -1247,7 +1282,7 @@ class BrowserSession:
                 }""")
                 if not explicit or not self._video_visible(node):
                     continue
-                if self.task_completed(node):
+                if self._task_skip_reason(node):
                     continue
                 source = node.get_attribute("src") or node.get_attribute("data") or ""
                 if re.search(r"/(?:work|quiz|exam|homework)(?:/|[.])|doHomeWork", urlparse(source).path, re.I):
@@ -1845,6 +1880,9 @@ class BrowserSession:
             raise BrowserError("未找到可见的视频播放器。")
         deadline = time.monotonic() + float(self.settings.video_timeout)
         for number, video in enumerate(videos, start=1):
+            if not self.task_required(video):
+                self.log(f"视频 {number}/{len(videos)} 未标记为任务点，跳过播放。")
+                continue
             with self._video_pointer_scope(video):
                 self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
                 last_position, progressed_at, play_requested_at = -1.0, time.monotonic(), 0.0
@@ -2174,8 +2212,9 @@ class BrowserSession:
         for number, target in enumerate(targets, start=1):
             self._guard()
             try:
-                if self.task_completed(target):
-                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，跳过静态阅读。")
+                skip_reason = self._task_skip_reason(target)
+                if skip_reason:
+                    self.log(f"文档 {number}/{len(targets)} {skip_reason}，跳过静态阅读。")
                     continue
                 identity = self._content_identity(target, "document")
                 if identity in processed:
@@ -2184,11 +2223,11 @@ class BrowserSession:
                 target.scroll_into_view_if_needed(timeout=3000)
                 previous_top, stuck, bottom_reads = -1.0, 0, 0
                 bottom_since, bottom_signature, last_log = 0.0, None, 0.0
-                marked_complete = False
+                skip_reason = ""
                 for _ in range(1200):
                     self._guard()
-                    if self.task_completed(target):
-                        marked_complete = True
+                    skip_reason = self._task_skip_reason(target)
+                    if skip_reason:
                         break
                     metrics = self._scroll_metrics(target)
                     if metrics["client"] < 1 or metrics["height"] < 1:
@@ -2221,16 +2260,16 @@ class BrowserSession:
                                  f"鼠标位置 ({x:.0f}, {y:.0f})。")
                         last_log = time.monotonic()
                     self._move_mouse(x, y)
-                    if self.task_completed(target):
-                        marked_complete = True
+                    skip_reason = self._task_skip_reason(target)
+                    if skip_reason:
                         break
                     self._page.mouse.wheel(0, random.uniform(650, 1000))
                     # wheel dispatch returns before the browser finishes scrolling.
                     self._wait(random.uniform(0.18, 0.32))
                 else:
                     raise BrowserError("文档页过长或一直加载新内容，已停止自动滚动。")
-                if marked_complete:
-                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，结束静态阅读。")
+                if skip_reason:
+                    self.log(f"文档 {number}/{len(targets)} {skip_reason}，结束静态阅读。")
                     continue
                 metrics = self._scroll_metrics(target)
                 if metrics["top"] + metrics["client"] < metrics["height"] - 3:
@@ -2257,7 +2296,7 @@ class BrowserSession:
                       and not locators.nth(index).evaluate(
                           "e => !!e.closest('nav, aside, [role=navigation], .catalog, .course-outline')")]
             if blocks:
-                blocks = [block for block in blocks if not self._completed_video_region(block)]
+                blocks = [block for block in blocks if not self._inactive_video_region(block)]
                 if blocks:
                     return blocks
         containers = root.locator("div, section, article, fieldset, li")
@@ -2279,7 +2318,7 @@ class BrowserSession:
                 && item.element.contains(other.element))).slice(0,200).map(item=>item.index);
         }""")
         return [containers.nth(index) for index in indices if self._visible(containers.nth(index))
-                and not self._completed_video_region(containers.nth(index))]
+                and not self._inactive_video_region(containers.nth(index))]
 
     def _has_quiz(self) -> bool:
         return any(self._question_blocks(frame) for frame in self._frames() if self._frame_visible(frame))
