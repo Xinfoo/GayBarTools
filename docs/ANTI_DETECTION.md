@@ -27,6 +27,8 @@
 
 每个区域开始处理前先读取其所属任务点的状态。已识别的学习通附件卡片没有自有任务点图标时，作为非任务参考资源跳过播放、滚动和加载等待；已明确完成的区域也跳过。隐藏图标仍表示有任务，但不证明完成；未知附件结构保持原有适配回退。此判断读取网站已有标记，不修改任务状态；已经开始播放的视频仍等待自然结束。
 
+点击“下一节”后的等待使用紧凑的浏览器端探测和单轮轮询缓存：题目只读取题号、题干、选项数量和标签，frame 可见性、body 文本、任务列表及结果判断在单轮内共享。完整题干、选项控件、文档正文和答案映射仍只在真正作答或阅读时提取；任务身份指纹仍使用完整 DOM/文本，不由廉价探测改写。该优化只减少重复读取，不改变播放、滚动、提交或网站完成标记，也不增加新的页面交互。
+
 ### 视频自然播放
 
 `_watch_video()` 通过播放器控件开始播放，读取 `currentTime`、`duration`、`paused`、`ended` 和 `playbackRate` 等状态，等待视频自然结束。
@@ -97,6 +99,7 @@
 | --- | --- |
 | [test_browser_integration.py](../tests/test_browser_integration.py) | 视频完整自然播放、没有 seek、倍速为 1；选项、提交、网页内确认与下一节的输入事件；两章完整流程 |
 | [test_next_page_integration.py](../tests/test_next_page_integration.py) | 同 URL 视图切换、内容页连续出现、已提交检测跳过重复作答及隐藏旧内容过滤 |
+| [test_navigation_probe.py](../tests/test_navigation_probe.py) | 导航轮询缓存、单次题目探测、导航期 `_has_quiz` 及独立答题页单目标 |
 | [test_next_warning_integration.py](../tests/test_next_warning_integration.py) | 未完成任务点提示框内下一节的真实点击、隐藏模板过滤、一次确认，以及弹层关闭后仍等待新内容 |
 | [test_retained_video_quiz_integration.py](../tests/test_retained_video_quiz_integration.py) | 残留或被覆盖播放器不阻挡章节答题、隐藏原生选项及内部滚动题目的真实输入 |
 | [test_aria_hidden_options_integration.py](../tests/test_aria_hidden_options_integration.py) | 真实 DOM 对应的可见 aria-hidden 选项、单选与多选状态标记、真实鼠标填写及本地提交 |
