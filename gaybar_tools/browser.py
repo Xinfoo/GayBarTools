@@ -198,6 +198,28 @@ _VIDEO_PROBE_SCRIPT = r"""(e) => ({
     id: e.id || ''
 })"""
 
+_RICH_TRAILING_BREAK_SCRIPT = r"""(root) => {
+    const tail = node => {
+        const children = [...node.childNodes];
+        for (let i = children.length - 1; i >= 0; i--) {
+            const child = children[i];
+            if (child.nodeType === 3) {
+                if (child.data.trim()) return /[\r\n]$/.test(child.data);
+                if (/[\r\n]/.test(child.data)) return true;
+                continue;
+            }
+            if (child.nodeType !== 1) continue;
+            if (child.tagName === 'BR') return true;
+            if (child.matches('p, div, li, section, article, blockquote')
+                && !child.innerText.trim()
+                && !child.querySelector('img, canvas, svg, video')) return true;
+            return tail(child);
+        }
+        return false;
+    };
+    return tail(root);
+}"""
+
 _CAPTCHA_PROBE_SCRIPT = r"""() => {
     const selector = '#captcha, #captchaBox, .captcha-box, .geetest_panel, .nc-container, '
         + 'input[name*=captcha i], input[id*=captcha i], iframe[src*=captcha i], '
@@ -3247,6 +3269,30 @@ class BrowserSession:
                 raise BrowserError("点击填空区域后未找到可编辑的文本框。")
             self._wait(.1)
 
+    def _trim_rich_text_tail(self, control: Any, actual: dict[str, Any]) -> dict[str, Any]:
+        """Remove a structural trailing newline produced by rich editors.
+
+        UEditor and plain contenteditable can leave an empty paragraph or a
+        trailing <br> after ``insert_text``. Only delete when the DOM tail is
+        actually an empty block/break, so a real trailing character is never
+        removed. Native input/textarea values are left untouched.
+        """
+        for _ in range(3):
+            text = actual.get("text") if isinstance(actual, dict) else None
+            if (not isinstance(actual, dict) or not actual.get("rich")
+                    or not isinstance(text, str) or not re.search(r"[\r\n]$", text)):
+                break
+            try:
+                if not control.evaluate(_RICH_TRAILING_BREAK_SCRIPT):
+                    break
+                self._page.keyboard.press("ControlOrMeta+End", timeout=3000)
+                self._page.keyboard.press("Backspace", timeout=3000)
+                actual = control.evaluate(
+                    "e => ({text: 'value' in e ? e.value : e.innerText, rich: !('value' in e)})")
+            except Exception:
+                break
+        return actual
+
     @staticmethod
     def _answer_text(value: str, *, rich: bool = False) -> str:
         value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -3404,6 +3450,7 @@ class BrowserSession:
                     self._page.keyboard.insert_text(text)
                     self._guard()
                     actual = control.evaluate("e => ({text: 'value' in e ? e.value : e.innerText, rich: !('value' in e)})")
+                    actual = self._trim_rich_text_tail(control, actual)
                     if self._answer_text(actual["text"], rich=actual["rich"]) != self._answer_text(text, rich=actual["rich"]):
                         raise BrowserError(f"无法确认题目 {question_id} 的文本答案已完整填写。")
                 self.log(f"已填写题目 {question_id}：{len(mapped[question_id].texts)} 个文本区域")
