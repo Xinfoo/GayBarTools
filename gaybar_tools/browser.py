@@ -1091,52 +1091,64 @@ class BrowserSession:
             tasks = sorted(content, key=lambda task: tuple(segment[2] for segment in task.order))
             pending_ready: dict[str, bool] = {}
             for task in tasks:
-                if task.region:
-                    parts.append(("task-region", task.kind, task.region))
-                    if task.completed or not task.required:
-                        continue
-                    if task.placeholder:
-                        if task.kind == "quiz" and self._unpublished_quiz(task.target):
+                try:
+                    if task.region:
+                        parts.append(("task-region", task.kind, task.region))
+                        if task.completed or not task.required:
                             continue
-                        pending_ready[task.identity] = False
-                        continue
-                if task.kind == "quiz":
-                    probe = self._quiz_probe(task.target)
-                    if not task.region:
-                        parts.append(("quiz", probe["signature"]))
-                    pending_ready[task.identity] = bool(probe["ready"])
-                    continue
-                if task.kind == "video":
-                    state = self._video_probe(task.target)
-                    source = "" if state["source"].startswith("blob:") else state["source"]
-                    if not task.region:
-                        parts.append(("video", source, state["poster"], state["id"]))
-                    # A mounted player is enough for navigation. Media can be
-                    # attached only after the real playback click.
-                    pending_ready[task.identity] = True
-                else:
-                    data = self._document_probe(task.target)
-                    if re.fullmatch(r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", data["text"]):
-                        pending_ready[task.identity] = False
-                        continue
-                    if data["text"] or data["media"]:
+                        if task.placeholder:
+                            if task.kind == "quiz" and self._unpublished_quiz(task.target):
+                                continue
+                            pending_ready[task.identity] = False
+                            continue
+                    if task.kind == "quiz":
+                        probe = self._quiz_probe(task.target)
                         if not task.region:
-                            parts.append(("document", data["signature"]))
-                    pending_ready[task.identity] = bool(data["text"] or data["media"])
+                            parts.append(("quiz", probe["signature"]))
+                        pending_ready[task.identity] = bool(probe["ready"])
+                        continue
+                    if task.kind == "video":
+                        state = self._video_probe(task.target)
+                        source = "" if state["source"].startswith("blob:") else state["source"]
+                        if not task.region:
+                            parts.append(("video", source, state["poster"], state["id"]))
+                        # A mounted player is enough for navigation. Media can be
+                        # attached only after the real playback click.
+                        pending_ready[task.identity] = True
+                    else:
+                        data = self._document_probe(task.target)
+                        if re.fullmatch(r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", data["text"]):
+                            pending_ready[task.identity] = False
+                            continue
+                        if data["text"] or data["media"]:
+                            if not task.region:
+                                parts.append(("document", data["signature"]))
+                        pending_ready[task.identity] = bool(data["text"] or data["media"])
+                except BrowserError:
+                    raise
+                except Exception:
+                    # The target was replaced while the poll was reading it.
+                    pending_ready[task.identity] = False
+                    continue
             ready = next((pending_ready[task.identity] for task in content
                           if task.identity in pending_ready), bool(tasks))
         elif kind == "quiz":
             for frame in self._frames():
-                if not self._frame_visible_memo(frame):
+                try:
+                    if not self._frame_visible_memo(frame):
+                        continue
+                    probe = self._quiz_probe(frame)
+                    submitted = self._result_probe_cached(frame)
+                    rows = probe["rows"]
+                    if rows:
+                        ready = ready and (submitted or probe["ready"])
+                        parts.append(("quiz", probe["signature"]))
+                    elif submitted:
+                        parts.append(("quiz-result",))
+                except BrowserError:
+                    raise
+                except Exception:
                     continue
-                probe = self._quiz_probe(frame)
-                submitted = self._result_probe_cached(frame)
-                rows = probe["rows"]
-                if rows:
-                    ready = ready and (submitted or probe["ready"])
-                    parts.append(("quiz", probe["signature"]))
-                elif submitted:
-                    parts.append(("quiz-result",))
         if not parts:
             return "", False
         payload = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1265,8 +1277,25 @@ class BrowserSession:
             # attachment card again for every player.
             unfinished = [task.target for task in tasks
                           if task.kind == "video" and task.required and not task.completed]
-            finished = all(video.evaluate("v => v.ended") for video in unfinished)
-            if not finished or any(self._find_video_quiz(video) is not None for video in unfinished):
+
+            def safe_ended(video: Any) -> bool:
+                try:
+                    return bool(video.evaluate("v => v.ended"))
+                except BrowserError:
+                    raise
+                except Exception:
+                    return False
+
+            def safe_video_quiz(video: Any) -> bool:
+                try:
+                    return self._find_video_quiz(video) is not None
+                except BrowserError:
+                    raise
+                except Exception:
+                    return False
+
+            finished = all(safe_ended(video) for video in unfinished)
+            if not finished or any(safe_video_quiz(video) for video in unfinished):
                 return "video"
         if quizzes or self._has_quiz() or self._result_visible():
             return "quiz"
@@ -1591,21 +1620,27 @@ class BrowserSession:
         """
         targets: dict[str, Any] = {}
         for frame in self._frames():
-            if not self._frame_visible_memo(frame):
-                continue
-            probe = self._quiz_probe(frame)
-            submitted = self._result_probe_cached(frame)
-            if not probe["rows"] and not submitted:
-                continue
-            if probe["rows"] and self._root_has_task_cards(frame):
-                blocks = self._question_blocks(frame)
-                if blocks:
-                    for block in blocks:
-                        target = self._assessment_target(block)
-                        targets[self._content_identity(target, "quiz")] = target
+            try:
+                if not self._frame_visible_memo(frame):
                     continue
-            target = frame.locator("body")
-            targets[self._content_identity(target, "quiz")] = target
+                probe = self._quiz_probe(frame)
+                submitted = self._result_probe_cached(frame)
+                if not probe["rows"] and not submitted:
+                    continue
+                if probe["rows"] and self._root_has_task_cards(frame):
+                    blocks = self._question_blocks(frame)
+                    if blocks:
+                        for block in blocks:
+                            target = self._assessment_target(block)
+                            targets[self._content_identity(target, "quiz")] = target
+                        continue
+                target = frame.locator("body")
+                targets[self._content_identity(target, "quiz")] = target
+            except BrowserError:
+                raise
+            except Exception:
+                # The frame can detach between the fast click and this poll.
+                continue
         return list(targets.values())
 
     def _quiz_roots_for(self, target: Any) -> list[Any]:
@@ -1738,35 +1773,52 @@ class BrowserSession:
         for kind, targets in (("video", videos), ("document", documents),
                               ("quiz", self._chapter_quiz_targets())):
             for target in targets:
-                identity = self._content_identity(target, kind)
-                region = self._task_region_info(target)
-                if kind == "quiz" and not region and (videos or documents):
-                    # Unowned questions near a generic player can be unrelated
-                    # examples/decoys. Only identified attachment assessments
-                    # join that page's ordered work; legacy standalone quiz
-                    # recognition still handles the next assessment view.
-                    continue
-                submitted = kind == "quiz" and self._result_probe_cached(target)
-                tasks.append(ContentTask(kind, target, identity, self._content_order(target),
-                    completed=submitted or bool(region and region["completed"]), region=region["descriptor"] if region else "",
-                    required=region["required"] if region else True))
+                try:
+                    identity = self._content_identity(target, kind)
+                    region = self._task_region_info(target)
+                    if kind == "quiz" and not region and (videos or documents):
+                        # Unowned questions near a generic player can be unrelated
+                        # examples/decoys. Only identified attachment assessments
+                        # join that page's ordered work; legacy standalone quiz
+                        # recognition still handles the next assessment view.
+                        continue
+                    submitted = kind == "quiz" and self._result_probe_cached(target)
+                    tasks.append(ContentTask(kind, target, identity, self._content_order(target),
+                        completed=submitted or bool(region and region["completed"]), region=region["descriptor"] if region else "",
+                        required=region["required"] if region else True))
+                except BrowserError:
+                    raise
+                except Exception:
+                    # A fast navigation click can replace the document while
+                    # this poll is still reading the old frame. That target is
+                    # no longer part of the page; retry on the next poll.
+                    if self._navigation_mode:
+                        continue
+                    raise
         known_regions = {task.region for task in tasks if task.region}
         for frame in self._frames():
-            if not self._frame_visible_memo(frame):
-                continue
-            anchors = frame.locator(".ans-attach-ct iframe, .ans-attach-ct embed, .ans-attach-ct object")
-            for index in range(min(anchors.count(), 200)):
-                anchor = anchors.nth(index)
-                if not self._visible(anchor) or not self._video_visible(anchor):
+            try:
+                if not self._frame_visible_memo(frame):
                     continue
-                region = self._task_region_info(anchor, placeholder=True)
-                if not region or region["descriptor"] in known_regions:
+                anchors = frame.locator(".ans-attach-ct iframe, .ans-attach-ct embed, .ans-attach-ct object")
+                for index in range(min(anchors.count(), 200)):
+                    anchor = anchors.nth(index)
+                    if not self._visible(anchor) or not self._video_visible(anchor):
+                        continue
+                    region = self._task_region_info(anchor, placeholder=True)
+                    if not region or region["descriptor"] in known_regions:
+                        continue
+                    kind = region["kind"]
+                    tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
+                        self._content_order(anchor), completed=region["completed"], placeholder=True,
+                        region=region["descriptor"], required=region["required"]))
+                    known_regions.add(region["descriptor"])
+            except BrowserError:
+                raise
+            except Exception:
+                if self._navigation_mode:
                     continue
-                kind = region["kind"]
-                tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
-                    self._content_order(anchor), completed=region["completed"], placeholder=True,
-                    region=region["descriptor"], required=region["required"]))
-                known_regions.add(region["descriptor"])
+                raise
         # A real DOM node can be reached through more than one reader selector.
         unique = {task.identity: task for task in tasks}
         return sorted(unique.values(), key=lambda task: task.order)
@@ -1981,7 +2033,7 @@ class BrowserSession:
             self._wait(random.uniform(0.008, 0.025))
         self._mouse = (x, y)
 
-    def _click(self, locator: Any) -> None:
+    def _click(self, locator: Any, *, humanized: bool = True) -> None:
         self._guard()
         if not self._visible(locator):
             raise BrowserError("目标控件不可见，已停止以免误点。")
@@ -1994,10 +2046,12 @@ class BrowserSession:
             raise BrowserError("无法确定控件的屏幕位置。")
         x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
         y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-        self._delay()
+        if humanized:
+            self._delay()
         self._move_mouse(x, y)
-        self._page.mouse.click(x, y, delay=random.uniform(65, 140))
-        self._delay()
+        self._page.mouse.click(x, y, delay=random.uniform(65, 140) if humanized else 0)
+        if humanized:
+            self._delay()
 
     def watch_video(self, on_quiz: VideoQuizSolver | None = None) -> None:
         try:
@@ -3541,11 +3595,12 @@ class BrowserSession:
             return False
         if warning is not None:
             self.log("检测到未完成任务点提示，点击提示框内的下一节。")
-        self._click(button)
+        self._click(button, humanized=False)
         warning_confirmed = warning is not None
         deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
         candidate, candidate_since = None, 0.0
         departed_since = 0.0
+        transient_errors = 0
         kind, content_ready = previous_kind, _previous_ready
         while time.monotonic() < deadline:
             # One discovery pass per poll; chapter_kind, the signature and the
@@ -3559,23 +3614,32 @@ class BrowserSession:
                     if re.search(r"(?:^|\s)(?:disabled|disable)(?:\s|$)", warning.get_attribute("class") or ""):
                         raise BrowserError("任务点提示框中的下一节按钮当前不可用。")
                     self.log("检测到未完成任务点提示，点击提示框内的下一节。")
-                    self._click(warning)
+                    self._click(warning, humanized=False)
                     warning_confirmed = True
                     deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
                 self._wait(0.25)
                 continue
-            ready = self.poll_ready()
-            kind = self.chapter_kind()
             try:
+                ready = self.poll_ready()
+                kind = self.chapter_kind()
                 signature, content_ready = (self._view_signature(kind, include_occluded=True)
                                            if include_occluded else self._view_signature(kind))
+                # A valid reader may have neither Chaoxing URL markers nor a
+                # quiz tab. Explicit content recognition is sufficient after
+                # the click.
+                chapter = self._chapter_identifier()
             except (BrowserError, StopRequested):
                 raise
             except Exception:
-                signature, content_ready = "", False
-            # A valid reader may have neither Chaoxing URL markers nor a quiz
-            # tab. Explicit content recognition is sufficient after the click.
-            chapter = self._chapter_identifier()
+                # The fast click can replace the old frame while a probe is
+                # still resolving a locator. Treat that as a transient poll
+                # failure and retry on the new document.
+                transient_errors += 1
+                if transient_errors >= 8:
+                    raise
+                self._wait(0.1)
+                continue
+            transient_errors = 0
             changed = kind != previous_kind or signature != previous
             if include_occluded and kind in {"video", "document", "mixed"} and previous_kind in {"video", "document", "mixed"}:
                 changed = signature != previous

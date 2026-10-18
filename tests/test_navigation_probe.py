@@ -79,6 +79,36 @@ class NavigationProbeTests(unittest.TestCase):
 
         self.assertEqual(targets, [body])
 
+    def test_content_discovery_skips_a_detached_target(self):
+        bad = Mock()
+        with patch.object(self.session, "_guard"), \
+                patch.object(self.session, "_frames", return_value=[]), \
+                patch.object(self.session, "_video_locators", return_value=[bad]), \
+                patch.object(self.session, "_document_targets", return_value=[]), \
+                patch.object(self.session, "_chapter_quiz_targets", return_value=[]), \
+                patch.object(self.session, "_content_identity",
+                             side_effect=RuntimeError("Locator.count: Frame was detached")):
+            self.assertEqual(self.session.content_tasks(_cached=True), [])
+
+    def test_quiz_target_discovery_skips_a_detached_frame(self):
+        frame = Mock()
+        with patch.object(self.session, "_frames", return_value=[frame]), \
+                patch.object(self.session, "_frame_visible_memo", return_value=True), \
+                patch.object(self.session, "_quiz_probe",
+                             side_effect=RuntimeError("Locator.count: Frame was detached")):
+            self.assertEqual(self.session._chapter_quiz_targets_fast(), [])
+
+    def test_chapter_kind_keeps_video_when_player_was_detached(self):
+        video = Mock()
+        video.evaluate.side_effect = RuntimeError("Locator.count: Frame was detached")
+        task = ContentTask("video", video, "video:1", (0, 0, (0,)))
+        with patch.object(self.session, "_guard"), \
+                patch.object(self.session, "content_tasks", return_value=[task]), \
+                patch.object(self.session, "_find_video_quiz") as find_quiz:
+            self.assertEqual(self.session.chapter_kind(), "video")
+
+        find_quiz.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

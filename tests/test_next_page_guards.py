@@ -96,6 +96,30 @@ class NextPageGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(BrowserError, '章节没有变化'):
                 self.session.next_chapter()
 
+    def test_detached_frame_during_poll_is_retried_instead_of_stopping(self):
+        calls = {"count": 0}
+
+        def chapter_kind():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return "document"
+            if calls["count"] == 2:
+                raise RuntimeError("Locator.count: Frame was detached")
+            return "quiz"
+
+        self.session.chapter_kind.side_effect = chapter_kind
+        with patch.object(self.session, "_view_signature",
+                          side_effect=lambda kind: ("old", True) if kind == "document"
+                          else ("questions", True)):
+            self.assertTrue(self.session.next_chapter())
+        self.assertGreaterEqual(calls["count"], 3)
+
+    def test_next_button_uses_the_fast_click_path(self):
+        with patch.object(self.session, '_view_signature', return_value=('old', True)):
+            with self.assertRaisesRegex(BrowserError, '章节没有变化'):
+                self.session.next_chapter()
+        self.session._click.assert_called_once_with(self.button, humanized=False)
+
     def test_explicit_completion_destination_ends_normally(self):
         self.session.poll_ready.return_value = False
         self.session.chapter_kind.side_effect = lambda: 'document' if self.clock == 0 else 'unknown'
