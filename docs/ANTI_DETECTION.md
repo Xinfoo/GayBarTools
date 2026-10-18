@@ -25,6 +25,8 @@
 
 以下实现让流程依赖页面状态，其中一部分主要用于减少误操作，而非隐藏自动化特征。
 
+每个区域开始处理前先读取其所属任务点的完成状态，已明确完成的区域跳过播放或滚动，其余保持原有处理流程。此判断读取网站已有标记，不修改任务状态；已经开始播放的视频仍等待自然结束。
+
 ### 视频自然播放
 
 `_watch_video()` 通过播放器控件开始播放，读取 `currentTime`、`duration`、`paused`、`ended` 和 `playbackRate` 等状态，等待视频自然结束。
@@ -92,6 +94,7 @@
 | [test_video_quiz_integration.py](../tests/test_video_quiz_integration.py) | 中途插题的选项、提交和继续学习输入事件；连续插题、嵌套 iframe 与局部截图；答题后自然播放结束、无 seek 和倍速变化 |
 | [test_document_scroll_integration.py](../tests/test_document_scroll_integration.py) | 正文内实际滚轮、到达底部、避开外层和目录，以及嵌套 iframe、遮挡和懒加载场景 |
 | [test_mixed_tasks_integration.py](../tests/test_mixed_tasks_integration.py) | 多文档和视频混排的真实操作顺序、同地址独立阅读器、动态新增内容，以及失败或停止后不进入下一节 |
+| [test_task_completion_integration.py](../tests/test_task_completion_integration.py) | 各区域完成标记的独立判断、已完成区域零播放及滚轮、剩余任务顺序，以及完成状态与真实材料切换的区分 |
 | [test_cookie_integration.py](../tests/test_cookie_integration.py) | 会话恢复、退出登录后的快照更新、普通与演示配置分离 |
 
 本地测试检查了相应输入事件的 `isTrusted` 属性，但该属性不能证明操作者是真人，也不能代表学习通对自动化的识别结果。目前没有平台风控通过率、封禁概率或“无法检测”的实测结论。真实站点与本地演示的差异见 [录屏分析与验证范围](VIDEO_NOTES.md)。

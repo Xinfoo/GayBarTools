@@ -46,6 +46,9 @@ class ContentTask:
     target: Any
     identity: str
     order: tuple[Any, ...]
+    completed: bool = False
+    placeholder: bool = False
+    region: str = ""
 
 
 _CHAPTER_URL = re.compile(r"/(?:mycourse/studentstudy|knowledge/cards|studentstudy)(?:[/?]|$)", re.I)
@@ -97,6 +100,7 @@ class BrowserSession:
         self._quiz_view_rows: dict[Any, tuple[float, list[Any]]] = {}
         self._content_nodes: list[tuple[Any, float, Any, str]] = []
         self._content_sequence = 0
+        self._task_regions: list[dict[str, Any]] = []
         self._owner_thread: int | None = None
         self._mouse = (0.0, 0.0)
         self._unexpected_dialog = ""
@@ -523,6 +527,7 @@ class BrowserSession:
     def _select_page(self, page: Any) -> None:
         if page is not self._page:
             self._clear_content_nodes()
+            self._clear_task_regions()
             self._page, self._mouse = page, (0.0, 0.0)
             self._question_controls.clear()
             self._questions.clear()
@@ -617,6 +622,13 @@ class BrowserSession:
             content = self.content_tasks(include_occluded=True) if include_occluded else self.content_tasks()
             tasks = sorted(content, key=lambda task: tuple(segment[2] for segment in task.order))
             for task in tasks:
+                if task.region:
+                    parts.append(("task-region", task.kind, task.region))
+                    if task.completed:
+                        continue
+                    if task.placeholder:
+                        ready = False
+                        continue
                 if task.kind == "video":
                     state = task.target.evaluate("""e => ({
                         source:e.getAttribute('src') ||
@@ -624,7 +636,8 @@ class BrowserSession:
                         poster:e.getAttribute('poster') || '', id:e.id || ''
                     })""")
                     source = "" if state["source"].startswith("blob:") else state["source"]
-                    parts.append(("video", source, state["poster"], state["id"]))
+                    if not task.region:
+                        parts.append(("video", source, state["poster"], state["id"]))
                     # preload="none" metadata is unavailable before play.
                     ready = ready and bool(state["source"])
                 else:
@@ -633,7 +646,8 @@ class BrowserSession:
                         ready = False
                         continue
                     if data["text"] or data["media"]:
-                        parts.append(("document", data["text"], data["media"]))
+                        if not task.region:
+                            parts.append(("document", data["text"], data["media"]))
                     else:
                         ready = False
         elif kind == "quiz":
@@ -678,7 +692,7 @@ class BrowserSession:
     @staticmethod
     def _document_semantic(target: Any) -> dict[str, Any]:
         return target.evaluate("""(e, {warningPattern, dialogs}) => {
-                    const chrome='button, input, select, textarea, script, style, nav, [role=status], '
+                    const chrome='button, input, select, textarea, script, style, nav, .ans-job-icon, [role=status], '
                         + '[role=progressbar], .status, .progress, .toolbar, .reader-toolbar, ' + dialogs;
                     const warning=new RegExp(warningPattern), warnings=[];
                     const text=n=>(n.innerText || n.textContent || '').replace(/\\s+/g,' ').trim();
@@ -777,8 +791,9 @@ class BrowserSession:
             # A completed player can remain in the DOM after 下一节 loads a
             # separate assessment. It must not mask the new questions. Keep
             # unfinished playback and player-owned overlays in the video flow.
-            finished = all(video.evaluate("v => v.ended") for video in videos)
-            if not finished or any(self._find_video_quiz(video) is not None for video in videos):
+            unfinished = [video for video in videos if not self.task_completed(video)]
+            finished = all(video.evaluate("v => v.ended") for video in unfinished)
+            if not finished or any(self._find_video_quiz(video) is not None for video in unfinished):
                 return "video"
         if self._has_quiz() or self._result_visible():
             return "quiz"
@@ -786,6 +801,9 @@ class BrowserSession:
             return "video"
         if self._document_targets():
             return "document"
+        tasks = self.content_tasks()
+        if tasks:
+            return tasks[0].kind
         return "unknown"
 
     def _clear_content_nodes(self) -> None:
@@ -795,6 +813,190 @@ class BrowserSession:
                 handle.dispose()
             except Exception:
                 pass
+
+    def _clear_task_regions(self) -> None:
+        regions, self._task_regions = self._task_regions, []
+        for region in regions:
+            try:
+                region["node"].dispose()
+            except Exception:
+                pass
+
+    def _task_region(self, target: Any) -> tuple[Any, Any] | None:
+        """Find only this target's nearest attachment card, across frames."""
+        current = target.element_handle(timeout=1500)
+        while current is not None:
+            try:
+                frame = current.owner_frame()
+                region = current.evaluate_handle("e => e.closest('.ans-attach-ct')")
+                element = region.as_element()
+                if element is not None:
+                    return element, frame
+                region.dispose()
+                if frame is None or frame.parent_frame is None:
+                    return None
+                parent = frame.frame_element()
+            finally:
+                current.dispose()
+            current = parent
+        return None
+
+    @staticmethod
+    def _region_state(region: Any) -> dict[str, Any]:
+        return region.evaluate(r"""card => {
+            const visible=e=>{
+                const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
+                for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);
+                    if(n.hidden||n.inert||s.display==='none'||s.visibility==='hidden'
+                       ||s.contentVisibility==='hidden'||Number(s.opacity)===0)return false;}
+                return true;
+            };
+            const markers=[...card.querySelectorAll('.ans-job-icon')].filter(e=>
+                e.closest('.ans-attach-ct')===card&&visible(e));
+            const labels=markers.flatMap(e=>[e.getAttribute('aria-label'),e.getAttribute('title'),
+                e.getAttribute('data-original-title'),e.innerText].map(s=>(s||'').replace(/\s+/g,' ').trim()));
+            // Static PDF cards can paint an empty icon entirely through this
+            // owner class. Require the card's own visible icon, and let an
+            // explicit unfinished label override a stale completed class.
+            const completed=labels.includes('任务点已完成')
+                || (card.classList.contains('ans-job-finished')&&markers.length>0);
+            const attachments=[...card.querySelectorAll('iframe,video,embed,object')]
+                .filter(e=>e.closest('.ans-attach-ct')===card);
+            const video=attachments.some(e=>e.tagName==='VIDEO'||/ans-insertvideo|modules\/video\//i.test(
+                (e.className||'')+' '+(e.getAttribute('src')||'')));
+            const quiz=attachments.some(e=>/\/(?:work|quiz|exam|homework)(?:\/|[.])|doHomeWork/i.test(e.getAttribute('src')||''));
+            const keys=['objectid','objectId','jobid','jobId','fileid','fileId','resourceid','resourceId','aid'];
+            const ids=[];
+            for(const e of [card,...attachments]){
+                for(const key of ['data-resource-id','data-objectid','data-object-id','data-fileid','data-file-id','objectid','jobid']){
+                    const value=e.getAttribute(key);if(value)ids.push([key,value]);
+                }
+                try{const data=JSON.parse(e.getAttribute('data')||'{}');
+                    for(const key of keys)if(data[key]!==undefined&&data[key]!==null)ids.push([key,String(data[key])]);
+                }catch{}
+            }
+            const sources=attachments.map(e=>{
+                const raw=e.getAttribute('src')||(['EMBED','OBJECT'].includes(e.tagName)?e.getAttribute('data'):'')||'';
+                if(!raw||raw==='about:blank'||raw.startsWith('blob:'))return '';
+                try{const url=new URL(raw,location.href);
+                    if(/\/ananas\/modules\/(?:video|pdf|ppt|doc)\/index\.html/i.test(url.pathname))return '';
+                    for(const key of [...url.searchParams.keys()])if(/^(?:_|v|t|ts|timestamp|enc|token|expires|signature|isPassed|progress|completed)$/i.test(key))url.searchParams.delete(key);
+                    return url.origin+url.pathname+url.search;
+                }catch{return '';}
+            }).filter(Boolean);
+            const path=[];for(let n=card;n&&n.parentElement;n=n.parentElement)path.unshift([...n.parentElement.children].indexOf(n));
+            return {completed:completed&&!labels.includes('任务点未完成'),
+                kind:video?'video':quiz?'quiz':'document',ids,sources,path};
+        }""")
+
+    def _task_marker_state(self, target: Any) -> dict[str, Any] | None:
+        self._check_stop()
+        owner = self._task_region(target)
+        if owner is None:
+            return None
+        region, _frame = owner
+        try:
+            return self._region_state(region)
+        finally:
+            region.dispose()
+
+    def task_completed(self, target: Any) -> bool:
+        state = self._task_marker_state(target)
+        return bool(state and state["completed"])
+
+    def _completed_video_region(self, target: Any) -> bool:
+        state = self._task_marker_state(target)
+        return bool(state and state["completed"] and state["kind"] == "video")
+
+    def _task_region_info(self, target: Any, *, placeholder: bool = False) -> dict[str, Any] | None:
+        owner = self._task_region(target)
+        if owner is None:
+            return None
+        region, frame = owner
+        retained = False
+        try:
+            state = self._region_state(region)
+            origin = frame.evaluate("performance.timeOrigin")
+            inner = None
+            if not placeholder:
+                if state["kind"] == "video":
+                    inner = target.evaluate(r"""e => {
+                        const card=e.closest('.ans-attach-ct'),scope=card||document;
+                        const normalize=raw=>{
+                            if(!raw||raw.startsWith('blob:'))return '';
+                            try{const url=new URL(raw,location.href);
+                                for(const key of [...url.searchParams.keys()])if(/^(?:_|v|t|ts|timestamp|enc|token|expires|signature|isPassed|progress|completed)$/i.test(key))url.searchParams.delete(key);
+                                return url.origin+url.pathname+url.search;
+                            }catch{return raw;}
+                        };
+                        return [...scope.querySelectorAll('video')]
+                            .filter(v=>v.closest('.ans-attach-ct')===card)
+                            .map(v=>[normalize(v.getAttribute('src')||v.currentSrc||''),v.getAttribute('poster')||'']);
+                    }""")
+                else:
+                    scope = target.evaluate_handle("e => e.closest('.ans-attach-ct') || document.body")
+                    try:
+                        inner = self._document_semantic(scope)
+                    finally:
+                        scope.dispose()
+            # Job/owner IDs alone cannot identify the actual material. Include
+            # the scoped media/text as well, never a sibling task's resources.
+            material = [state["ids"], state["sources"], inner]
+            inner_known = bool(inner)
+            if state["kind"] == "video":
+                inner_known = bool(inner and any(source for source, _poster in inner))
+            elif isinstance(inner, dict):
+                inner_known = bool(inner["text"] or inner["media"]) and not bool(re.fullmatch(
+                    r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", inner["text"]))
+            fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            outer = hashlib.sha256(json.dumps([state["ids"], state["sources"]], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            outer_known = bool(state["ids"] or state["sources"])
+            entries = [entry for entry in self._task_regions if entry["frame"] is frame and entry["origin"] == origin]
+            index = region.evaluate("(e,nodes)=>nodes.findIndex(node=>node===e)", [entry["node"] for entry in entries]) if entries else -1
+            if index >= 0:
+                entry = entries[index]
+                outer_changed = outer_known and entry["outer_known"] and outer != entry["outer"]
+                if outer_changed:
+                    # Explicitly changing an attachment's resource is a new
+                    # material even when both old and new remain unmounted.
+                    entry["material"] = fingerprint
+                    entry["descriptor"] = hashlib.sha256((entry["base"] + fingerprint).encode()).hexdigest()[:24]
+                    entry["was_placeholder"] = placeholder
+                    entry["inner_known"] = inner_known
+                elif (entry["was_placeholder"] or not entry["inner_known"]) and not placeholder and inner_known:
+                    # First mounting of the same completed attachment is not
+                    # navigation. Adopt its real resource while keeping key.
+                    entry["material"] = fingerprint
+                    entry["was_placeholder"] = False
+                elif fingerprint != entry["material"] and not placeholder and inner_known:
+                    entry["material"] = fingerprint
+                    entry["descriptor"] = hashlib.sha256((entry["base"] + fingerprint).encode()).hexdigest()[:24]
+                if inner_known:
+                    entry["inner_known"] = True
+                if outer_known:
+                    entry["outer"], entry["outer_known"] = outer, True
+                descriptor = entry["descriptor"]
+            else:
+                lineage = [state["path"]]
+                ancestor = frame
+                while ancestor.parent_frame is not None:
+                    element = ancestor.frame_element()
+                    try:
+                        lineage.insert(0, element.evaluate("""e=>{const p=[];for(let n=e;n&&n.parentElement;n=n.parentElement)p.unshift([...n.parentElement.children].indexOf(n));return p;}"""))
+                    finally:
+                        element.dispose()
+                    ancestor = ancestor.parent_frame
+                base = json.dumps([state["kind"], lineage], separators=(",", ":"))
+                descriptor = hashlib.sha256((base + fingerprint).encode()).hexdigest()[:24]
+                self._task_regions.append({"frame": frame, "origin": origin, "node": region,
+                    "base": base, "material": fingerprint, "descriptor": descriptor,
+                    "was_placeholder": placeholder, "outer": outer, "outer_known": outer_known,
+                    "inner_known": inner_known})
+                retained = True
+            return {"completed": state["completed"], "kind": state["kind"], "descriptor": descriptor}
+        finally:
+            if not retained:
+                region.dispose()
 
     def _content_identity(self, target: Any, kind: str) -> str:
         handle = target.element_handle(timeout=2000)
@@ -863,7 +1065,26 @@ class BrowserSession:
                               ("document", self._document_targets())):
             for target in targets:
                 identity = self._content_identity(target, kind)
-                tasks.append(ContentTask(kind, target, identity, self._content_order(target)))
+                region = self._task_region_info(target)
+                tasks.append(ContentTask(kind, target, identity, self._content_order(target),
+                    completed=bool(region and region["completed"]), region=region["descriptor"] if region else ""))
+        known_regions = {task.region for task in tasks if task.region}
+        for frame in self._frames():
+            if not self._frame_visible(frame):
+                continue
+            anchors = frame.locator(".ans-attach-ct iframe, .ans-attach-ct embed, .ans-attach-ct object")
+            for index in range(min(anchors.count(), 200)):
+                anchor = anchors.nth(index)
+                if not self._visible(anchor) or not self._video_visible(anchor):
+                    continue
+                region = self._task_region_info(anchor, placeholder=True)
+                if not region or region["kind"] == "quiz" or region["descriptor"] in known_regions:
+                    continue
+                kind = region["kind"]
+                tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
+                    self._content_order(anchor), completed=region["completed"], placeholder=True,
+                    region=region["descriptor"]))
+                known_regions.add(region["descriptor"])
         # A real DOM node can be reached through more than one reader selector.
         unique = {task.identity: task for task in tasks}
         return sorted(unique.values(), key=lambda task: task.order)
@@ -874,6 +1095,8 @@ class BrowserSession:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
         completed: set[str] = set()
+        executed = 0
+        skipped = 0
         stable_end = 0
         unresolved_since = 0.0
         try:
@@ -883,6 +1106,12 @@ class BrowserSession:
                 pending = [task for task in tasks if task.identity not in completed]
                 if pending:
                     stable_end = 0
+                    task = pending[0]
+                    if self.task_completed(task.target):
+                        completed.add(task.identity)
+                        skipped += 1
+                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        continue
                     if self._unresolved_content(tasks, before=pending[0].order):
                         if not unresolved_since:
                             unresolved_since = time.monotonic()
@@ -890,11 +1119,22 @@ class BrowserSession:
                             raise BrowserError("前面的学习附件尚未加载完成，请检查阅读器；不会先处理后面的任务。")
                         self._wait(max(0.4, float(self.settings.poll_interval)))
                         continue
+                    if task.placeholder:
+                        if not unresolved_since:
+                            unresolved_since = time.monotonic()
+                        if time.monotonic() - unresolved_since >= self.NEXT_PAGE_TIMEOUT:
+                            raise BrowserError("当前学习附件尚未加载完成，请检查阅读器；不会先处理后面的任务。")
+                        self._wait(max(0.4, float(self.settings.poll_interval)))
+                        continue
                     unresolved_since = 0.0
-                    task = pending[0]
-                    number = len(completed) + 1
+                    number = executed + 1
                     if on_task is not None:
-                        on_task(task.kind, number, len(completed) + len(pending))
+                        on_task(task.kind, number, executed + sum(not item.completed for item in pending))
+                    if self.task_completed(task.target):
+                        completed.add(task.identity)
+                        skipped += 1
+                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        continue
                     self.log(f"按页面顺序处理第 {number} 个任务：{'视频' if task.kind == 'video' else '静态阅读'}。")
                     if task.kind == "video":
                         try:
@@ -905,6 +1145,7 @@ class BrowserSession:
                     else:
                         self._read_document_targets([task.target])
                     completed.add(task.identity)
+                    executed += 1
                     continue
                 if not completed:
                     raise BrowserError("当前页面没有可处理的视频或静态阅读任务。")
@@ -930,8 +1171,8 @@ class BrowserSession:
                     final_tasks = self.content_tasks()
                     if (not [task for task in final_tasks if task.identity not in completed]
                             and not self._unresolved_content(final_tasks)):
-                        self.log(f"本页 {len(completed)} 个学习任务已全部处理完成。")
-                        return len(completed)
+                        self.log(f"本页学习任务已处理完毕：执行 {executed} 个，跳过已完成 {skipped} 个。")
+                        return executed
                     stable_end = 0
             raise BrowserError("页面持续出现新的学习任务，已停止以防无限循环。")
         finally:
@@ -942,6 +1183,8 @@ class BrowserSession:
         """Do not silently skip an explicitly mounted unreadable attachment."""
         covered: set[Any] = set()
         for task in tasks:
+            if task.placeholder:
+                continue
             handle = task.target.element_handle(timeout=1000)
             if handle is None:
                 continue
@@ -972,6 +1215,8 @@ class BrowserSession:
                     return true;
                 }""")
                 if not explicit or not self._video_visible(node):
+                    continue
+                if self.task_completed(node):
                     continue
                 source = node.get_attribute("src") or node.get_attribute("data") or ""
                 if re.search(r"/(?:work|quiz|exam|homework)(?:/|[.])|doHomeWork", urlparse(source).path, re.I):
@@ -1590,6 +1835,16 @@ class BrowserSession:
         # scrolling document itself is represented by its viewport instead.
         return locator.evaluate(r"""e => {
             const root=e===document.body||e===document.documentElement;
+            const htmlStyle=getComputedStyle(document.documentElement);
+            const bodyStyle=document.body?getComputedStyle(document.body):null;
+            // With visible HTML overflow, BODY's overflow belongs to the
+            // viewport. Its own box can be empty or move above the viewport
+            // during window scrolling without clipping visible descendants.
+            // Containment disables this propagation; independent BODY scroll
+            // containers must still clip like other ordinary ancestors.
+            const bodyOverflowToViewport=bodyStyle
+                && htmlStyle.overflowX==='visible'&&htmlStyle.overflowY==='visible'
+                && htmlStyle.contain==='none'&&bodyStyle.contain==='none';
             const box=n => {
                 const r=n.getBoundingClientRect();
                 const sx=n.offsetWidth ? r.width/n.offsetWidth : 1;
@@ -1601,6 +1856,10 @@ class BrowserSession:
             let left=Math.max(0,r.x), top=Math.max(0,r.y);
             let right=Math.min(innerWidth,r.x+r.width), bottom=Math.min(innerHeight,r.y+r.height);
             if (!root) for(let n=e.parentElement;n;n=n.parentElement){
+                // The viewport intersection above already accounts for root
+                // overflow. Do not clip it a second time using moving boxes.
+                if(n===document.documentElement||n===document.scrollingElement
+                    ||(n===document.body&&bodyOverflowToViewport))continue;
                 const s=getComputedStyle(n), a=box(n);
                 if(/(auto|scroll|hidden|clip)/.test(s.overflowX)){
                     left=Math.max(left,a.x);right=Math.min(right,a.x+a.width);
@@ -1716,6 +1975,9 @@ class BrowserSession:
         for number, target in enumerate(targets, start=1):
             self._guard()
             try:
+                if self.task_completed(target):
+                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，跳过静态阅读。")
+                    continue
                 identity = self._content_identity(target, "document")
                 if identity in processed:
                     continue
@@ -1723,8 +1985,12 @@ class BrowserSession:
                 target.scroll_into_view_if_needed(timeout=3000)
                 previous_top, stuck, bottom_reads = -1.0, 0, 0
                 bottom_since, bottom_signature, last_log = 0.0, None, 0.0
+                marked_complete = False
                 for _ in range(1200):
                     self._guard()
+                    if self.task_completed(target):
+                        marked_complete = True
+                        break
                     metrics = self._scroll_metrics(target)
                     if metrics["client"] < 1 or metrics["height"] < 1:
                         raise BrowserError("文档阅读区域尺寸无效，无法确认阅读进度。")
@@ -1756,11 +2022,17 @@ class BrowserSession:
                                  f"鼠标位置 ({x:.0f}, {y:.0f})。")
                         last_log = time.monotonic()
                     self._move_mouse(x, y)
+                    if self.task_completed(target):
+                        marked_complete = True
+                        break
                     self._page.mouse.wheel(0, random.uniform(650, 1000))
                     # wheel dispatch returns before the browser finishes scrolling.
                     self._wait(random.uniform(0.18, 0.32))
                 else:
                     raise BrowserError("文档页过长或一直加载新内容，已停止自动滚动。")
+                if marked_complete:
+                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，结束静态阅读。")
+                    continue
                 metrics = self._scroll_metrics(target)
                 if metrics["top"] + metrics["client"] < metrics["height"] - 3:
                     raise BrowserError("尚未确认文档已滚动到底部。")
@@ -1770,7 +2042,7 @@ class BrowserSession:
                 raise
             except Exception as exc:
                 raise BrowserError("文档结构变化，无法确认已经读到底部。") from exc
-        self.log("已确认文档阅读区域到底部。")
+        self.log("文档阅读区域已处理完毕。")
 
     def _question_blocks(self, root: Any) -> list[Any]:
         """Find question bodies from content, never from activity tab captions.
@@ -1786,7 +2058,9 @@ class BrowserSession:
                       and not locators.nth(index).evaluate(
                           "e => !!e.closest('nav, aside, [role=navigation], .catalog, .course-outline')")]
             if blocks:
-                return blocks
+                blocks = [block for block in blocks if not self._completed_video_region(block)]
+                if blocks:
+                    return blocks
         containers = root.locator("div, section, article, fieldset, li")
         indices = containers.evaluate_all(r"""elements => {
             const marker=/(?:单选|多选|判断)题/;
@@ -1805,7 +2079,8 @@ class BrowserSession:
             return matches.filter(item=>!matches.some(other=>other!==item
                 && item.element.contains(other.element))).slice(0,200).map(item=>item.index);
         }""")
-        return [containers.nth(index) for index in indices if self._visible(containers.nth(index))]
+        return [containers.nth(index) for index in indices if self._visible(containers.nth(index))
+                and not self._completed_video_region(containers.nth(index))]
 
     def _has_quiz(self) -> bool:
         return any(self._question_blocks(frame) for frame in self._frames() if self._frame_visible(frame))
@@ -2225,6 +2500,7 @@ class BrowserSession:
         if self._owner_thread is not None and self._owner_thread != threading.get_ident():
             raise BrowserError("请在浏览器工作线程中关闭浏览器。")
         self._clear_content_nodes()
+        self._clear_task_regions()
         # Stop only cancels course actions. The last checkpoint must still run
         # before Chromium closes, while its session cookies remain readable.
         self._checkpoint_cookies(force=True)
