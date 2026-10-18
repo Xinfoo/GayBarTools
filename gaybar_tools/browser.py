@@ -1,7 +1,8 @@
 """Synchronous, conservative Playwright adapter for visible chapter controls.
 
-JavaScript inspects DOM and media state; it never changes media position, speed,
-answers, or task flags. A session belongs to the worker thread that launched it.
+JavaScript inspects DOM/media state and filters pointer exits during video work;
+it never changes media position, speed, answers, or task flags. A session belongs
+to the worker thread that launched it.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import random
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -26,7 +28,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import AppSettings
 from .cookies import CookieStore, CookieStoreError
 from .isolation import IsolationError, prepare_browser_executable
-from .models import Answer, Option, Question
+from .models import Answer, Option, Question, VideoQuizSolver
 from .paths import AppPaths
 
 
@@ -46,6 +48,9 @@ class ContentTask:
     target: Any
     identity: str
     order: tuple[Any, ...]
+    completed: bool = False
+    placeholder: bool = False
+    region: str = ""
 
 
 _CHAPTER_URL = re.compile(r"/(?:mycourse/studentstudy|knowledge/cards|studentstudy)(?:[/?]|$)", re.I)
@@ -69,8 +74,25 @@ _VIDEO_QUESTION_BLOCKS = _QUESTION_BLOCKS + (".tk_topic", ".tkTopic", ".videoqui
 _VIDEO_TITLES = _QUESTION_TITLES + ", .tk_title, .tk-title, .tkTopic_title, .topic-title"
 _VIDEO_OPTIONS = (".tkitem, .tkItem, .tk-item, .tk-option, .videoquiz-options > li",) + _OPTION_SELECTORS
 _VIDEO_CONTINUE = re.compile(r"^(?:继续学习|继续播放|返回视频)$")
-_VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)")
+_VIDEO_WRONG = re.compile(r"(?:回答|答案|作答)(?:不正确|错误)|答错(?:了)?|很遗憾.*(?:错误|答错)|(?:真|很)遗憾[，,\s]*再接再厉")
 _VIDEO_RIGHT = re.compile(r"恭喜.*(?:答对|正确)|(?:回答|答案|作答)正确|答对了")
+
+# Registered before page scripts, but inert outside the current video scope.
+# Keep native event APIs, focus/visibility state and media methods untouched.
+_POINTER_EXIT_BOOTSTRAP = """key => {
+    const slot = Symbol.for(key);
+    if (Object.prototype.hasOwnProperty.call(window, slot)) return;
+    let active = false;
+    const boundary = event => {
+        if (active && event.isTrusted && event.relatedTarget === null
+            && (event.type.startsWith('mouse') || event.pointerType === 'mouse'))
+            event.stopImmediatePropagation();
+    };
+    for (const type of ['mouseout', 'mouseleave', 'pointerout', 'pointerleave'])
+        window.addEventListener(type, boundary, {capture: true});
+    Object.defineProperty(window, slot, {configurable: true,
+        value: {setActive: value => {active = value === true;}}});
+}"""
 
 
 def _clean(value: str) -> str:
@@ -79,6 +101,7 @@ def _clean(value: str) -> str:
 
 class BrowserSession:
     VIDEO_QUIZ_WAIT_TIMEOUT = 15.0
+    MAX_VIDEO_QUIZ_CORRECTIONS = 5
     VIDEO_START_TIMEOUT = 15.0
     PAUSED_QUIZ_GRACE = 1.0
     VIDEO_QUIZ_POLL_INTERVAL = 0.2
@@ -97,6 +120,9 @@ class BrowserSession:
         self._quiz_view_rows: dict[Any, tuple[float, list[Any]]] = {}
         self._content_nodes: list[tuple[Any, float, Any, str]] = []
         self._content_sequence = 0
+        self._task_regions: list[dict[str, Any]] = []
+        self._pointer_guard_key = secrets.token_hex(24)
+        self._pointer_guards: list[tuple[Any, float, Any]] = []
         self._owner_thread: int | None = None
         self._mouse = (0.0, 0.0)
         self._unexpected_dialog = ""
@@ -324,6 +350,7 @@ class BrowserSession:
                 options["executable_path"] = executable
                 self._context = self._playwright.chromium.launch_persistent_context(
                     user_data_dir=str(self.paths.profile), **options)
+            self._context.add_init_script(self._pointer_guard_script())
             self._context.set_default_timeout(5000)
             self._context.set_default_navigation_timeout(20000)
             self._restore_login_state()
@@ -523,6 +550,7 @@ class BrowserSession:
     def _select_page(self, page: Any) -> None:
         if page is not self._page:
             self._clear_content_nodes()
+            self._clear_task_regions()
             self._page, self._mouse = page, (0.0, 0.0)
             self._question_controls.clear()
             self._questions.clear()
@@ -606,7 +634,8 @@ class BrowserSession:
 
         Only semantic content changes count as a new activity. Updating the
         outer URL/title while an old iframe is still on screen must not release
-        the transition wait. An empty or loading document supplies no signature.
+        the transition wait. Readiness follows the first pending task; later
+        attachments can finish loading before their own turn.
         """
         parts: list[Any] = []
         ready = True
@@ -616,7 +645,15 @@ class BrowserSession:
             # stable signature, rather than viewport/scroll coordinates.
             content = self.content_tasks(include_occluded=True) if include_occluded else self.content_tasks()
             tasks = sorted(content, key=lambda task: tuple(segment[2] for segment in task.order))
+            pending_ready: dict[str, bool] = {}
             for task in tasks:
+                if task.region:
+                    parts.append(("task-region", task.kind, task.region))
+                    if task.completed:
+                        continue
+                    if task.placeholder:
+                        pending_ready[task.identity] = False
+                        continue
                 if task.kind == "video":
                     state = task.target.evaluate("""e => ({
                         source:e.getAttribute('src') ||
@@ -624,18 +661,26 @@ class BrowserSession:
                         poster:e.getAttribute('poster') || '', id:e.id || ''
                     })""")
                     source = "" if state["source"].startswith("blob:") else state["source"]
-                    parts.append(("video", source, state["poster"], state["id"]))
-                    # preload="none" metadata is unavailable before play.
-                    ready = ready and bool(state["source"])
+                    if not task.region:
+                        parts.append(("video", source, state["poster"], state["id"]))
+                    # Some players attach their media only after a real play
+                    # click. A mounted player is enough for navigation; the
+                    # playback workflow handles loading after that click.
+                    pending_ready[task.identity] = True
                 else:
                     data = self._document_semantic(task.target)
                     if re.fullmatch(r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", data["text"]):
-                        ready = False
+                        pending_ready[task.identity] = False
                         continue
                     if data["text"] or data["media"]:
-                        parts.append(("document", data["text"], data["media"]))
-                    else:
-                        ready = False
+                        if not task.region:
+                            parts.append(("document", data["text"], data["media"]))
+                    pending_ready[task.identity] = bool(data["text"] or data["media"])
+            # Later readers may load only after the preceding video finishes
+            # or after they scroll into view. They cannot hold navigation to
+            # an already usable first task; execution handles tasks in order.
+            ready = next((pending_ready[task.identity] for task in content
+                          if task.identity in pending_ready), bool(tasks))
         elif kind == "quiz":
             for frame in self._frames():
                 if not self._frame_visible(frame):
@@ -678,7 +723,7 @@ class BrowserSession:
     @staticmethod
     def _document_semantic(target: Any) -> dict[str, Any]:
         return target.evaluate("""(e, {warningPattern, dialogs}) => {
-                    const chrome='button, input, select, textarea, script, style, nav, [role=status], '
+                    const chrome='button, input, select, textarea, script, style, nav, .ans-job-icon, [role=status], '
                         + '[role=progressbar], .status, .progress, .toolbar, .reader-toolbar, ' + dialogs;
                     const warning=new RegExp(warningPattern), warnings=[];
                     const text=n=>(n.innerText || n.textContent || '').replace(/\\s+/g,' ').trim();
@@ -777,8 +822,9 @@ class BrowserSession:
             # A completed player can remain in the DOM after 下一节 loads a
             # separate assessment. It must not mask the new questions. Keep
             # unfinished playback and player-owned overlays in the video flow.
-            finished = all(video.evaluate("v => v.ended") for video in videos)
-            if not finished or any(self._find_video_quiz(video) is not None for video in videos):
+            unfinished = [video for video in videos if not self.task_completed(video)]
+            finished = all(video.evaluate("v => v.ended") for video in unfinished)
+            if not finished or any(self._find_video_quiz(video) is not None for video in unfinished):
                 return "video"
         if self._has_quiz() or self._result_visible():
             return "quiz"
@@ -786,6 +832,9 @@ class BrowserSession:
             return "video"
         if self._document_targets():
             return "document"
+        tasks = self.content_tasks()
+        if tasks:
+            return tasks[0].kind
         return "unknown"
 
     def _clear_content_nodes(self) -> None:
@@ -795,6 +844,190 @@ class BrowserSession:
                 handle.dispose()
             except Exception:
                 pass
+
+    def _clear_task_regions(self) -> None:
+        regions, self._task_regions = self._task_regions, []
+        for region in regions:
+            try:
+                region["node"].dispose()
+            except Exception:
+                pass
+
+    def _task_region(self, target: Any) -> tuple[Any, Any] | None:
+        """Find only this target's nearest attachment card, across frames."""
+        current = target.element_handle(timeout=1500)
+        while current is not None:
+            try:
+                frame = current.owner_frame()
+                region = current.evaluate_handle("e => e.closest('.ans-attach-ct')")
+                element = region.as_element()
+                if element is not None:
+                    return element, frame
+                region.dispose()
+                if frame is None or frame.parent_frame is None:
+                    return None
+                parent = frame.frame_element()
+            finally:
+                current.dispose()
+            current = parent
+        return None
+
+    @staticmethod
+    def _region_state(region: Any) -> dict[str, Any]:
+        return region.evaluate(r"""card => {
+            const visible=e=>{
+                const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;
+                for(let n=e;n;n=n.parentElement){const s=getComputedStyle(n);
+                    if(n.hidden||n.inert||s.display==='none'||s.visibility==='hidden'
+                       ||s.contentVisibility==='hidden'||Number(s.opacity)===0)return false;}
+                return true;
+            };
+            const markers=[...card.querySelectorAll('.ans-job-icon')].filter(e=>
+                e.closest('.ans-attach-ct')===card&&visible(e));
+            const labels=markers.flatMap(e=>[e.getAttribute('aria-label'),e.getAttribute('title'),
+                e.getAttribute('data-original-title'),e.innerText].map(s=>(s||'').replace(/\s+/g,' ').trim()));
+            // Static PDF cards can paint an empty icon entirely through this
+            // owner class. Require the card's own visible icon, and let an
+            // explicit unfinished label override a stale completed class.
+            const completed=labels.includes('任务点已完成')
+                || (card.classList.contains('ans-job-finished')&&markers.length>0);
+            const attachments=[...card.querySelectorAll('iframe,video,embed,object')]
+                .filter(e=>e.closest('.ans-attach-ct')===card);
+            const video=attachments.some(e=>e.tagName==='VIDEO'||/ans-insertvideo|modules\/video\//i.test(
+                (e.className||'')+' '+(e.getAttribute('src')||'')));
+            const quiz=attachments.some(e=>/\/(?:work|quiz|exam|homework)(?:\/|[.])|doHomeWork/i.test(e.getAttribute('src')||''));
+            const keys=['objectid','objectId','jobid','jobId','fileid','fileId','resourceid','resourceId','aid'];
+            const ids=[];
+            for(const e of [card,...attachments]){
+                for(const key of ['data-resource-id','data-objectid','data-object-id','data-fileid','data-file-id','objectid','jobid']){
+                    const value=e.getAttribute(key);if(value)ids.push([key,value]);
+                }
+                try{const data=JSON.parse(e.getAttribute('data')||'{}');
+                    for(const key of keys)if(data[key]!==undefined&&data[key]!==null)ids.push([key,String(data[key])]);
+                }catch{}
+            }
+            const sources=attachments.map(e=>{
+                const raw=e.getAttribute('src')||(['EMBED','OBJECT'].includes(e.tagName)?e.getAttribute('data'):'')||'';
+                if(!raw||raw==='about:blank'||raw.startsWith('blob:'))return '';
+                try{const url=new URL(raw,location.href);
+                    if(/\/ananas\/modules\/(?:video|pdf|ppt|doc)\/index\.html/i.test(url.pathname))return '';
+                    for(const key of [...url.searchParams.keys()])if(/^(?:_|v|t|ts|timestamp|enc|token|expires|signature|isPassed|progress|completed)$/i.test(key))url.searchParams.delete(key);
+                    return url.origin+url.pathname+url.search;
+                }catch{return '';}
+            }).filter(Boolean);
+            const path=[];for(let n=card;n&&n.parentElement;n=n.parentElement)path.unshift([...n.parentElement.children].indexOf(n));
+            return {completed:completed&&!labels.includes('任务点未完成'),
+                kind:video?'video':quiz?'quiz':'document',ids,sources,path};
+        }""")
+
+    def _task_marker_state(self, target: Any) -> dict[str, Any] | None:
+        self._check_stop()
+        owner = self._task_region(target)
+        if owner is None:
+            return None
+        region, _frame = owner
+        try:
+            return self._region_state(region)
+        finally:
+            region.dispose()
+
+    def task_completed(self, target: Any) -> bool:
+        state = self._task_marker_state(target)
+        return bool(state and state["completed"])
+
+    def _completed_video_region(self, target: Any) -> bool:
+        state = self._task_marker_state(target)
+        return bool(state and state["completed"] and state["kind"] == "video")
+
+    def _task_region_info(self, target: Any, *, placeholder: bool = False) -> dict[str, Any] | None:
+        owner = self._task_region(target)
+        if owner is None:
+            return None
+        region, frame = owner
+        retained = False
+        try:
+            state = self._region_state(region)
+            origin = frame.evaluate("performance.timeOrigin")
+            inner = None
+            if not placeholder:
+                if state["kind"] == "video":
+                    inner = target.evaluate(r"""e => {
+                        const card=e.closest('.ans-attach-ct'),scope=card||document;
+                        const normalize=raw=>{
+                            if(!raw||raw.startsWith('blob:'))return '';
+                            try{const url=new URL(raw,location.href);
+                                for(const key of [...url.searchParams.keys()])if(/^(?:_|v|t|ts|timestamp|enc|token|expires|signature|isPassed|progress|completed)$/i.test(key))url.searchParams.delete(key);
+                                return url.origin+url.pathname+url.search;
+                            }catch{return raw;}
+                        };
+                        return [...scope.querySelectorAll('video')]
+                            .filter(v=>v.closest('.ans-attach-ct')===card)
+                            .map(v=>[normalize(v.getAttribute('src')||v.currentSrc||''),v.getAttribute('poster')||'']);
+                    }""")
+                else:
+                    scope = target.evaluate_handle("e => e.closest('.ans-attach-ct') || document.body")
+                    try:
+                        inner = self._document_semantic(scope)
+                    finally:
+                        scope.dispose()
+            # Job/owner IDs alone cannot identify the actual material. Include
+            # the scoped media/text as well, never a sibling task's resources.
+            material = [state["ids"], state["sources"], inner]
+            inner_known = bool(inner)
+            if state["kind"] == "video":
+                inner_known = bool(inner and any(source for source, _poster in inner))
+            elif isinstance(inner, dict):
+                inner_known = bool(inner["text"] or inner["media"]) and not bool(re.fullmatch(
+                    r"(?:正在)?加载(?:中)?[.。…\s]*|请稍[候等][.。…\s]*", inner["text"]))
+            fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            outer = hashlib.sha256(json.dumps([state["ids"], state["sources"]], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            outer_known = bool(state["ids"] or state["sources"])
+            entries = [entry for entry in self._task_regions if entry["frame"] is frame and entry["origin"] == origin]
+            index = region.evaluate("(e,nodes)=>nodes.findIndex(node=>node===e)", [entry["node"] for entry in entries]) if entries else -1
+            if index >= 0:
+                entry = entries[index]
+                outer_changed = outer_known and entry["outer_known"] and outer != entry["outer"]
+                if outer_changed:
+                    # Explicitly changing an attachment's resource is a new
+                    # material even when both old and new remain unmounted.
+                    entry["material"] = fingerprint
+                    entry["descriptor"] = hashlib.sha256((entry["base"] + fingerprint).encode()).hexdigest()[:24]
+                    entry["was_placeholder"] = placeholder
+                    entry["inner_known"] = inner_known
+                elif (entry["was_placeholder"] or not entry["inner_known"]) and not placeholder and inner_known:
+                    # First mounting of the same completed attachment is not
+                    # navigation. Adopt its real resource while keeping key.
+                    entry["material"] = fingerprint
+                    entry["was_placeholder"] = False
+                elif fingerprint != entry["material"] and not placeholder and inner_known:
+                    entry["material"] = fingerprint
+                    entry["descriptor"] = hashlib.sha256((entry["base"] + fingerprint).encode()).hexdigest()[:24]
+                if inner_known:
+                    entry["inner_known"] = True
+                if outer_known:
+                    entry["outer"], entry["outer_known"] = outer, True
+                descriptor = entry["descriptor"]
+            else:
+                lineage = [state["path"]]
+                ancestor = frame
+                while ancestor.parent_frame is not None:
+                    element = ancestor.frame_element()
+                    try:
+                        lineage.insert(0, element.evaluate("""e=>{const p=[];for(let n=e;n&&n.parentElement;n=n.parentElement)p.unshift([...n.parentElement.children].indexOf(n));return p;}"""))
+                    finally:
+                        element.dispose()
+                    ancestor = ancestor.parent_frame
+                base = json.dumps([state["kind"], lineage], separators=(",", ":"))
+                descriptor = hashlib.sha256((base + fingerprint).encode()).hexdigest()[:24]
+                self._task_regions.append({"frame": frame, "origin": origin, "node": region,
+                    "base": base, "material": fingerprint, "descriptor": descriptor,
+                    "was_placeholder": placeholder, "outer": outer, "outer_known": outer_known,
+                    "inner_known": inner_known})
+                retained = True
+            return {"completed": state["completed"], "kind": state["kind"], "descriptor": descriptor}
+        finally:
+            if not retained:
+                region.dispose()
 
     def _content_identity(self, target: Any, kind: str) -> str:
         handle = target.element_handle(timeout=2000)
@@ -863,17 +1096,38 @@ class BrowserSession:
                               ("document", self._document_targets())):
             for target in targets:
                 identity = self._content_identity(target, kind)
-                tasks.append(ContentTask(kind, target, identity, self._content_order(target)))
+                region = self._task_region_info(target)
+                tasks.append(ContentTask(kind, target, identity, self._content_order(target),
+                    completed=bool(region and region["completed"]), region=region["descriptor"] if region else ""))
+        known_regions = {task.region for task in tasks if task.region}
+        for frame in self._frames():
+            if not self._frame_visible(frame):
+                continue
+            anchors = frame.locator(".ans-attach-ct iframe, .ans-attach-ct embed, .ans-attach-ct object")
+            for index in range(min(anchors.count(), 200)):
+                anchor = anchors.nth(index)
+                if not self._visible(anchor) or not self._video_visible(anchor):
+                    continue
+                region = self._task_region_info(anchor, placeholder=True)
+                if not region or region["kind"] == "quiz" or region["descriptor"] in known_regions:
+                    continue
+                kind = region["kind"]
+                tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
+                    self._content_order(anchor), completed=region["completed"], placeholder=True,
+                    region=region["descriptor"]))
+                known_regions.add(region["descriptor"])
         # A real DOM node can be reached through more than one reader selector.
         unique = {task.identity: task for task in tasks}
         return sorted(unique.values(), key=lambda task: task.order)
 
     def process_content(self, *,
-                        on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None,
+                        on_quiz: VideoQuizSolver | None = None,
                         on_task: Callable[[str, int, int], None] | None = None) -> int:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
         completed: set[str] = set()
+        executed = 0
+        skipped = 0
         stable_end = 0
         unresolved_since = 0.0
         try:
@@ -883,6 +1137,12 @@ class BrowserSession:
                 pending = [task for task in tasks if task.identity not in completed]
                 if pending:
                     stable_end = 0
+                    task = pending[0]
+                    if self.task_completed(task.target):
+                        completed.add(task.identity)
+                        skipped += 1
+                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        continue
                     if self._unresolved_content(tasks, before=pending[0].order):
                         if not unresolved_since:
                             unresolved_since = time.monotonic()
@@ -890,11 +1150,22 @@ class BrowserSession:
                             raise BrowserError("前面的学习附件尚未加载完成，请检查阅读器；不会先处理后面的任务。")
                         self._wait(max(0.4, float(self.settings.poll_interval)))
                         continue
+                    if task.placeholder:
+                        if not unresolved_since:
+                            unresolved_since = time.monotonic()
+                        if time.monotonic() - unresolved_since >= self.NEXT_PAGE_TIMEOUT:
+                            raise BrowserError("当前学习附件尚未加载完成，请检查阅读器；不会先处理后面的任务。")
+                        self._wait(max(0.4, float(self.settings.poll_interval)))
+                        continue
                     unresolved_since = 0.0
-                    task = pending[0]
-                    number = len(completed) + 1
+                    number = executed + 1
                     if on_task is not None:
-                        on_task(task.kind, number, len(completed) + len(pending))
+                        on_task(task.kind, number, executed + sum(not item.completed for item in pending))
+                    if self.task_completed(task.target):
+                        completed.add(task.identity)
+                        skipped += 1
+                        self.log("本区域任务点已完成，跳过视频播放或静态阅读。")
+                        continue
                     self.log(f"按页面顺序处理第 {number} 个任务：{'视频' if task.kind == 'video' else '静态阅读'}。")
                     if task.kind == "video":
                         try:
@@ -905,6 +1176,7 @@ class BrowserSession:
                     else:
                         self._read_document_targets([task.target])
                     completed.add(task.identity)
+                    executed += 1
                     continue
                 if not completed:
                     raise BrowserError("当前页面没有可处理的视频或静态阅读任务。")
@@ -930,8 +1202,8 @@ class BrowserSession:
                     final_tasks = self.content_tasks()
                     if (not [task for task in final_tasks if task.identity not in completed]
                             and not self._unresolved_content(final_tasks)):
-                        self.log(f"本页 {len(completed)} 个学习任务已全部处理完成。")
-                        return len(completed)
+                        self.log(f"本页学习任务已处理完毕：执行 {executed} 个，跳过已完成 {skipped} 个。")
+                        return executed
                     stable_end = 0
             raise BrowserError("页面持续出现新的学习任务，已停止以防无限循环。")
         finally:
@@ -942,6 +1214,8 @@ class BrowserSession:
         """Do not silently skip an explicitly mounted unreadable attachment."""
         covered: set[Any] = set()
         for task in tasks:
+            if task.placeholder:
+                continue
             handle = task.target.element_handle(timeout=1000)
             if handle is None:
                 continue
@@ -972,6 +1246,8 @@ class BrowserSession:
                     return true;
                 }""")
                 if not explicit or not self._video_visible(node):
+                    continue
+                if self.task_completed(node):
                     continue
                 source = node.get_attribute("src") or node.get_attribute("data") or ""
                 if re.search(r"/(?:work|quiz|exam|homework)(?:/|[.])|doHomeWork", urlparse(source).path, re.I):
@@ -1041,7 +1317,7 @@ class BrowserSession:
         self._page.mouse.click(x, y, delay=random.uniform(65, 140))
         self._delay()
 
-    def watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+    def watch_video(self, on_quiz: VideoQuizSolver | None = None) -> None:
         try:
             self._watch_video(on_quiz)
         except Exception:
@@ -1068,6 +1344,82 @@ class BrowserSession:
         if frame is None:
             raise BrowserError("无法确定视频所在页面。")
         return frame
+
+    def _pointer_guard_script(self) -> str:
+        return f"({_POINTER_EXIT_BOOTSTRAP})({json.dumps(self._pointer_guard_key)});"
+
+    @staticmethod
+    def _release_pointer_guard(handle: Any) -> None:
+        try:
+            handle.evaluate("guard => guard.setActive(false)")
+        except Exception:
+            pass  # Navigation/closing already destroyed this document.
+        finally:
+            try:
+                handle.dispose()
+            except Exception:
+                pass
+
+    def _clear_pointer_guards(self) -> None:
+        guards, self._pointer_guards = self._pointer_guards, []
+        for _, _, handle in guards:
+            self._release_pointer_guard(handle)
+
+    def _pointer_guard(self, frame: Any) -> Any:
+        origin = frame.evaluate("performance.timeOrigin")
+        kept = []
+        current = None
+        for owner, stamp, handle in self._pointer_guards:
+            if owner.is_detached() or (owner is frame and stamp != origin):
+                self._release_pointer_guard(handle)
+            else:
+                kept.append((owner, stamp, handle))
+                if owner is frame:
+                    current = handle
+        self._pointer_guards = kept
+        if current is not None:
+            return current
+        # The handoff uses a random, non-enumerable symbol, removed as soon as
+        # Python owns the handle. No fixed automation global or control events.
+        current = frame.evaluate_handle("""key => {
+            const slot = Symbol.for(key), guard = window[slot];
+            delete window[slot];
+            return guard;
+        }""", self._pointer_guard_key)
+        if current.evaluate("guard => guard === undefined"):
+            current.dispose()
+            # Existing about:blank/restored documents may predate add_init_script.
+            frame.evaluate(self._pointer_guard_script())
+            current = frame.evaluate_handle("""key => {
+                const slot = Symbol.for(key), guard = window[slot];
+                delete window[slot];
+                return guard;
+            }""", self._pointer_guard_key)
+        self._pointer_guards.append((frame, origin, current))
+        return current
+
+    @contextmanager
+    def _video_pointer_scope(self, video: Any) -> Iterator[None]:
+        active = []
+        try:
+            if self._context is not None:
+                try:
+                    frame = self._video_frame(video)
+                    while frame is not None:
+                        guard = self._pointer_guard(frame)
+                        guard.evaluate("guard => guard.setActive(true)")
+                        active.append(guard)
+                        frame = frame.parent_frame
+                except Exception:
+                    # A compatibility aid must not introduce a new blocker.
+                    self.log("未能启用部分页面的鼠标移出兼容，将沿用正常播放恢复流程。")
+            yield
+        finally:
+            for guard in reversed(active):
+                try:
+                    guard.evaluate("guard => guard.setActive(false)")
+                except Exception:
+                    pass  # A replaced frame no longer has an active listener.
 
     def _video_visible(self, locator: Any, *, player: bool = False, include_occluded: bool = False) -> bool:
         """Exclude retired player regions without hiding below-fold quiz rows."""
@@ -1316,8 +1668,44 @@ class BrowserSession:
             if self._selected(control) is not desired:
                 raise BrowserError("无法确认视频弹题选项已正确选中。")
 
+    @staticmethod
+    def _watch_video_feedback(root: Any, lines: list[str]) -> Any:
+        """Observe feedback rendering without changing the page or its answers."""
+        return root.evaluate_handle(r"""(root, lines) => {
+            const clean=s=>(s||'').replace(/\s+/g,' ').trim();
+            const matches=n=>n&&lines.some(line=>clean(n.textContent).includes(line));
+            const labels=[...root.querySelectorAll('*')].filter(n=>matches(n)
+                && ![...n.children].some(matches));
+            const visible=n=>{
+                if(!n.isConnected||!n.getClientRects().length)return false;
+                for(let e=n;e;e=e.parentElement){const s=getComputedStyle(e);
+                    if(e.hidden||s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)return false;}
+                return true;
+            };
+            const visibility=new Map(labels.map(n=>[n,visible(n)]));
+            const state={changed:false};
+            const inspect=records=>{
+                for(const m of records){
+                    if(m.type==='childList' && [...m.addedNodes,...m.removedNodes].some(matches))state.changed=true;
+                    if(m.type==='characterData' && (matches(m.target)
+                        || lines.some(line=>clean(m.oldValue).includes(line))))state.changed=true;
+                    if(m.type==='attributes')for(const n of labels){
+                        if(m.target!==n&&(n.parentElement===root||m.target!==n.parentElement))continue;
+                        const current=visible(n);
+                        if(current!==visibility.get(n))state.changed=true;
+                        visibility.set(n,current);
+                    }
+                }
+            };
+            state.observer=new MutationObserver(inspect);
+            state.observer.observe(root,{childList:true,subtree:true,characterData:true,
+                characterDataOldValue:true,attributes:true,attributeFilter:['hidden','style','class']});
+            state.read=()=>{inspect(state.observer.takeRecords());return state.changed;};
+            return state;
+        }""", lines)
+
     def _handle_video_quiz(self, root: Any, video: Any,
-                           on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None) -> None:
+                           on_quiz: VideoQuizSolver | None) -> None:
         self._guard()
         if on_quiz is None:
             raise BrowserError("视频出现答题界面，请启动带模型解题的自动流程。")
@@ -1326,49 +1714,104 @@ class BrowserSession:
             questions = self._extract_questions([root], video=video)
             if not questions:
                 raise BrowserError("视频弹题没有可识别的选择题，请查看诊断截图。")
-            fingerprint = self._question_fingerprint(questions)
             original_lines = {_clean(line) for line in root.inner_text(timeout=1500).splitlines()}
-            screenshot = self._video_quiz_screenshot(root, video) if self.settings.vision or self.settings.ocr else None
-            self.log(f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
-            answers = on_quiz(questions, screenshot)
-            self._guard()
-            current = self._extract_questions([root], video=video)
-            self._check_stop()
-            if self._question_fingerprint(current) != fingerprint:
-                raise BrowserError("模型回答期间视频弹题发生变化，已停止以免填写旧答案。")
-            self._apply_video_answers(answers, root, video)
-            deadline = time.monotonic() + self.VIDEO_QUIZ_WAIT_TIMEOUT
-            submitted = continued = False
-            while time.monotonic() < deadline:
+            # Restarting on an already rejected answer must also allow recovery.
+            # A phrase quoted in the question itself is not result feedback.
+            option_texts = {_clean(option.text) for q in questions for option in q.options}
+            existing_wrong = [line for line in original_lines if _VIDEO_WRONG.search(line)
+                              and not any(line in _clean(q.text) or _clean(q.text) in line for q in questions)
+                              and re.sub(r"^[A-Ha-h](?:[.、．:：)）\s]|$)\s*", "", line) not in option_texts]
+            original_lines.difference_update(existing_wrong)
+            corrections, correction_feedback = 0, None
+
+            def correction_note(previous: list[Answer], feedback: str, round_number: int) -> str:
+                return json.dumps({"correction_round": round_number,
+                    "previous_answers": [{"question_id": a.question_id, "choices": list(a.choices)} for a in previous],
+                    "feedback": feedback[:6000]}, ensure_ascii=False)
+
+            if existing_wrong:
+                previous = [Answer(q.id, tuple(label for label, control in self._question_controls[q.id].items()
+                                              if self._selected(control))) for q in questions]
+                corrections = 1
+                correction_feedback = correction_note(previous, "\n".join(existing_wrong), corrections)
+
+            while True:
                 self._guard()
-                active = bool(self._video_question_blocks(root, video))
-                state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
-                text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
-                feedback = " ".join(_clean(line) for line in text.splitlines() if _clean(line) not in original_lines)
-                if submitted and _VIDEO_WRONG.search(feedback):
-                    raise BrowserError("视频弹题答案未通过，已保留当前页面，请检查题目。")
-                continuation = self._text_control(_VIDEO_CONTINUE, root=root, video_quiz=True) if self._video_visible(root) else None
-                submit = self._text_control(_SUBMIT, root=root, video_quiz=True) if not submitted and active else None
-                if (continuation is not None and not continued
-                        and (submitted or _VIDEO_RIGHT.search(feedback) or submit is None)):
-                    self._click(continuation)
-                    continued = True
-                elif continuation is None and not active and (not state["paused"] or state["ended"]):
-                    self.log("视频弹题已处理，播放器已恢复。")
-                    return
-                elif submit is not None:
-                    current = self._extract_questions([root], video=video)
-                    self._check_stop()
-                    if current and self._question_fingerprint(current) != fingerprint:
-                        raise BrowserError("提交前视频弹题发生变化，已停止以免提交未经解答的题目。")
-                    if not current:
+                fingerprint = self._question_fingerprint(questions)
+                screenshot = (self._video_quiz_screenshot(root, video)
+                              if correction_feedback or self.settings.vision or self.settings.ocr else None)
+                self.log(f"正在纠正视频插题（{corrections}/{self.MAX_VIDEO_QUIZ_CORRECTIONS}）。"
+                         if correction_feedback else f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
+                answers = (on_quiz(questions, screenshot, video_quiz_feedback=correction_feedback)
+                           if correction_feedback else on_quiz(questions, screenshot))
+                self._guard()
+                current = self._extract_questions([root], video=video)
+                self._check_stop()
+                if self._question_fingerprint(current) != fingerprint:
+                    raise BrowserError("模型回答期间视频弹题发生变化，已停止以免填写旧答案。")
+                self._apply_video_answers(answers, root, video)
+                deadline = time.monotonic() + self.VIDEO_QUIZ_WAIT_TIMEOUT
+                submitted = continued = False
+                feedback_watch = None
+                try:
+                    while True:
+                        self._guard()
+                        active = bool(self._video_question_blocks(root, video))
+                        state = video.evaluate("v => ({paused:v.paused, ended:v.ended})")
+                        text = root.inner_text(timeout=1000) if self._video_visible(root) else ""
+                        feedback_lines = [_clean(line) for line in text.splitlines() if _clean(line) not in original_lines]
+                        feedback = "\n".join(feedback_lines)
+                        expired = time.monotonic() >= deadline
+                        wrong = submitted and bool(_VIDEO_WRONG.search(feedback))
+                        if wrong:
+                            # Old red text may remain while a new submission is
+                            # pending. Only a fresh rendering (or the full result
+                            # wait) counts as another rejected submission.
+                            fresh = feedback_watch is None or feedback_watch.evaluate("s => s.read()")
+                            if not fresh and not expired:
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            if corrections >= self.MAX_VIDEO_QUIZ_CORRECTIONS:
+                                raise BrowserError(f"视频插题已纠错 {corrections} 次仍未通过，已保留当前页面。")
+                            corrections += 1
+                            correction_feedback = correction_note(answers, feedback, corrections)
+                            questions = self._extract_questions([root], video=video)
+                            if not questions:
+                                raise BrowserError("答错后未能重新读取视频插题，请查看当前页面。")
+                            break
+                        if expired:
+                            raise BrowserError("视频弹题未能通过或未恢复播放，请检查当前题目。")
+                        continuation = self._text_control(_VIDEO_CONTINUE, root=root, video_quiz=True) if self._video_visible(root) else None
+                        submit = self._text_control(_SUBMIT, root=root, video_quiz=True) if not submitted and active else None
+                        if (continuation is not None and not continued
+                                and (submitted or _VIDEO_RIGHT.search(feedback) or submit is None)):
+                            self._click(continuation)
+                            continued = True
+                        elif continuation is None and not active and (not state["paused"] or state["ended"]):
+                            self.log("视频弹题已处理，播放器已恢复。")
+                            return
+                        elif submit is not None:
+                            current = self._extract_questions([root], video=video)
+                            self._check_stop()
+                            if current and self._question_fingerprint(current) != fingerprint:
+                                raise BrowserError("提交前视频弹题发生变化，已停止以免提交未经解答的题目。")
+                            if not current:
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            old_wrong = [line for line in feedback_lines if _VIDEO_WRONG.search(line)]
+                            if old_wrong:
+                                feedback_watch = self._watch_video_feedback(root, old_wrong)
+                            self._click(submit)
+                            submitted = True
                         self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-                        continue
-                    self._click(submit)
-                    submitted = True
-                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-            self._check_stop()
-            raise BrowserError("视频弹题未能通过或未恢复播放，请检查当前题目；不会重复提交或跳过视频。")
+                finally:
+                    if feedback_watch is not None:
+                        try:
+                            feedback_watch.evaluate("s => s.observer.disconnect()")
+                        except Exception:
+                            pass  # A closed/replaced frame already removed it.
+                        finally:
+                            feedback_watch.dispose()
         finally:
             self._questions, self._question_controls = old_questions, old_controls
 
@@ -1392,77 +1835,78 @@ class BrowserSession:
         except Exception:
             self.log("停止后未能确认播放器暂停，请手动检查浏览器。")
 
-    def _watch_video(self, on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+    def _watch_video(self, on_quiz: VideoQuizSolver | None = None) -> None:
         self._watch_video_targets(self._video_locators(), on_quiz)
 
     def _watch_video_targets(self, videos: list[Any],
-                             on_quiz: Callable[[list[Question], bytes | None], list[Answer]] | None = None) -> None:
+                             on_quiz: VideoQuizSolver | None = None) -> None:
         self._guard()
         if not videos:
             raise BrowserError("未找到可见的视频播放器。")
         deadline = time.monotonic() + float(self.settings.video_timeout)
         for number, video in enumerate(videos, start=1):
-            self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
-            last_position, progressed_at, play_requested_at = -1.0, time.monotonic(), 0.0
-            paused_since = 0.0
-            while True:
-                self._guard()
-                if time.monotonic() > deadline:
-                    raise BrowserError("视频等待超时，请检查播放器或网络。")
-                try:
-                    state = video.evaluate("""v => ({ended:v.ended, paused:v.paused,
-                        time:v.currentTime, duration:Number.isFinite(v.duration)?v.duration:0,
-                        rate:v.playbackRate, error:v.error?v.error.message:null})""")
-                except Exception as exc:
-                    raise BrowserError("视频播放器已发生变化，请确认当前章节。") from exc
-                if state["error"]:
-                    raise BrowserError(f"播放器错误：{state['error']}")
-                if abs(float(state["rate"]) - 1) > 0.01:
-                    raise BrowserError("检测到视频播放速度不是 1 倍，请手动恢复后再开始。")
-                if state["paused"] or state["ended"]:
-                    prompt = self._find_video_quiz(video)
-                    if prompt is not None:
-                        started = time.monotonic()
-                        self._handle_video_quiz(prompt, video, on_quiz)
-                        self._check_stop()
-                        # Model/OCR work is not buffering time or playback time.
-                        deadline += time.monotonic() - started
-                        progressed_at, play_requested_at, paused_since = time.monotonic(), 0.0, 0.0
-                        continue
-                if state["ended"]:
-                    self.log("视频已自然播放结束。")
-                    break
-                position = float(state["time"])
-                if position > last_position + 0.15:
-                    progressed_at, last_position = time.monotonic(), position
-                if state["paused"]:
-                    if play_requested_at:
-                        if time.monotonic() - play_requested_at < self.VIDEO_START_TIMEOUT:
-                            # A preload-none player may still be loading after
-                            # the trusted click. Keep polling for prompts/stop
-                            # without toggling the play control a second time.
+            with self._video_pointer_scope(video):
+                self.log(f"开始等待视频 {number}/{len(videos)} 自然播放结束。")
+                last_position, progressed_at, play_requested_at = -1.0, time.monotonic(), 0.0
+                paused_since = 0.0
+                while True:
+                    self._guard()
+                    if time.monotonic() > deadline:
+                        raise BrowserError("视频等待超时，请检查播放器或网络。")
+                    try:
+                        state = video.evaluate("""v => ({ended:v.ended, paused:v.paused,
+                            time:v.currentTime, duration:Number.isFinite(v.duration)?v.duration:0,
+                            rate:v.playbackRate, error:v.error?v.error.message:null})""")
+                    except Exception as exc:
+                        raise BrowserError("视频播放器已发生变化，请确认当前章节。") from exc
+                    if state["error"]:
+                        raise BrowserError(f"播放器错误：{state['error']}")
+                    if abs(float(state["rate"]) - 1) > 0.01:
+                        raise BrowserError("检测到视频播放速度不是 1 倍，请手动恢复后再开始。")
+                    if state["paused"] or state["ended"]:
+                        prompt = self._find_video_quiz(video)
+                        if prompt is not None:
+                            started = time.monotonic()
+                            self._handle_video_quiz(prompt, video, on_quiz)
+                            self._check_stop()
+                            # Model/OCR work is not buffering time or playback time.
+                            deadline += time.monotonic() - started
+                            progressed_at, play_requested_at, paused_since = time.monotonic(), 0.0, 0.0
+                            continue
+                    if state["ended"]:
+                        self.log("视频已自然播放结束。")
+                        break
+                    position = float(state["time"])
+                    if position > last_position + 0.15:
+                        progressed_at, last_position = time.monotonic(), position
+                    if state["paused"]:
+                        if play_requested_at:
+                            if time.monotonic() - play_requested_at < self.VIDEO_START_TIMEOUT:
+                                # A preload-none player may still be loading after
+                                # the trusted click. Keep polling for prompts/stop
+                                # without toggling the play control a second time.
+                                self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
+                                continue
+                            raise BrowserError("点击播放后视频仍未开始，请检查播放器加载状态或页面提示。")
+                        if not paused_since:
+                            paused_since = time.monotonic()
+                        if time.monotonic() - paused_since < self.PAUSED_QUIZ_GRACE:
                             self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
                             continue
-                        raise BrowserError("点击播放后视频仍未开始，请检查播放器加载状态或页面提示。")
-                    if not paused_since:
-                        paused_since = time.monotonic()
-                    if time.monotonic() - paused_since < self.PAUSED_QUIZ_GRACE:
-                        self._wait(self.VIDEO_QUIZ_POLL_INTERVAL)
-                        continue
-                    play = self._player_control(video,
-                        ".vjs-big-play-button, .vjs-play-control, button[aria-label*=Play], "
-                        "button[aria-label*=播放], [role=button][title=播放]")
-                    self._click(play if play is not None else video)
-                    play_requested_at = time.monotonic()
-                    self._wait(0.5)
-                elif time.monotonic() - progressed_at > 120:
-                    raise BrowserError("视频超过 120 秒没有进展，请检查缓冲或提示。")
-                else:
-                    paused_since, play_requested_at = 0.0, 0.0
-                if time.monotonic() - self._last_video_log > 30:
-                    self.log(f"视频进度 {int(position)} / {int(state['duration'])} 秒。")
-                    self._last_video_log = time.monotonic()
-                self._wait(max(0.25, float(self.settings.poll_interval)))
+                        play = self._player_control(video,
+                            ".vjs-big-play-button, .vjs-play-control, button[aria-label*=Play], "
+                            "button[aria-label*=播放], [role=button][title=播放]")
+                        self._click(play if play is not None else video)
+                        play_requested_at = time.monotonic()
+                        self._wait(0.5)
+                    elif time.monotonic() - progressed_at > 120:
+                        raise BrowserError("视频超过 120 秒没有进展，请检查缓冲或提示。")
+                    else:
+                        paused_since, play_requested_at = 0.0, 0.0
+                    if time.monotonic() - self._last_video_log > 30:
+                        self.log(f"视频进度 {int(position)} / {int(state['duration'])} 秒。")
+                        self._last_video_log = time.monotonic()
+                    self._wait(max(0.25, float(self.settings.poll_interval)))
 
     def _document_targets(self) -> list[Any]:
         # A reader's outer attachment/wrapper often never scrolls. Discover the
@@ -1590,6 +2034,16 @@ class BrowserSession:
         # scrolling document itself is represented by its viewport instead.
         return locator.evaluate(r"""e => {
             const root=e===document.body||e===document.documentElement;
+            const htmlStyle=getComputedStyle(document.documentElement);
+            const bodyStyle=document.body?getComputedStyle(document.body):null;
+            // With visible HTML overflow, BODY's overflow belongs to the
+            // viewport. Its own box can be empty or move above the viewport
+            // during window scrolling without clipping visible descendants.
+            // Containment disables this propagation; independent BODY scroll
+            // containers must still clip like other ordinary ancestors.
+            const bodyOverflowToViewport=bodyStyle
+                && htmlStyle.overflowX==='visible'&&htmlStyle.overflowY==='visible'
+                && htmlStyle.contain==='none'&&bodyStyle.contain==='none';
             const box=n => {
                 const r=n.getBoundingClientRect();
                 const sx=n.offsetWidth ? r.width/n.offsetWidth : 1;
@@ -1601,6 +2055,10 @@ class BrowserSession:
             let left=Math.max(0,r.x), top=Math.max(0,r.y);
             let right=Math.min(innerWidth,r.x+r.width), bottom=Math.min(innerHeight,r.y+r.height);
             if (!root) for(let n=e.parentElement;n;n=n.parentElement){
+                // The viewport intersection above already accounts for root
+                // overflow. Do not clip it a second time using moving boxes.
+                if(n===document.documentElement||n===document.scrollingElement
+                    ||(n===document.body&&bodyOverflowToViewport))continue;
                 const s=getComputedStyle(n), a=box(n);
                 if(/(auto|scroll|hidden|clip)/.test(s.overflowX)){
                     left=Math.max(left,a.x);right=Math.min(right,a.x+a.width);
@@ -1716,6 +2174,9 @@ class BrowserSession:
         for number, target in enumerate(targets, start=1):
             self._guard()
             try:
+                if self.task_completed(target):
+                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，跳过静态阅读。")
+                    continue
                 identity = self._content_identity(target, "document")
                 if identity in processed:
                     continue
@@ -1723,8 +2184,12 @@ class BrowserSession:
                 target.scroll_into_view_if_needed(timeout=3000)
                 previous_top, stuck, bottom_reads = -1.0, 0, 0
                 bottom_since, bottom_signature, last_log = 0.0, None, 0.0
+                marked_complete = False
                 for _ in range(1200):
                     self._guard()
+                    if self.task_completed(target):
+                        marked_complete = True
+                        break
                     metrics = self._scroll_metrics(target)
                     if metrics["client"] < 1 or metrics["height"] < 1:
                         raise BrowserError("文档阅读区域尺寸无效，无法确认阅读进度。")
@@ -1756,11 +2221,17 @@ class BrowserSession:
                                  f"鼠标位置 ({x:.0f}, {y:.0f})。")
                         last_log = time.monotonic()
                     self._move_mouse(x, y)
+                    if self.task_completed(target):
+                        marked_complete = True
+                        break
                     self._page.mouse.wheel(0, random.uniform(650, 1000))
                     # wheel dispatch returns before the browser finishes scrolling.
                     self._wait(random.uniform(0.18, 0.32))
                 else:
                     raise BrowserError("文档页过长或一直加载新内容，已停止自动滚动。")
+                if marked_complete:
+                    self.log(f"文档 {number}/{len(targets)} 任务点已完成，结束静态阅读。")
+                    continue
                 metrics = self._scroll_metrics(target)
                 if metrics["top"] + metrics["client"] < metrics["height"] - 3:
                     raise BrowserError("尚未确认文档已滚动到底部。")
@@ -1770,7 +2241,7 @@ class BrowserSession:
                 raise
             except Exception as exc:
                 raise BrowserError("文档结构变化，无法确认已经读到底部。") from exc
-        self.log("已确认文档阅读区域到底部。")
+        self.log("文档阅读区域已处理完毕。")
 
     def _question_blocks(self, root: Any) -> list[Any]:
         """Find question bodies from content, never from activity tab captions.
@@ -1786,7 +2257,9 @@ class BrowserSession:
                       and not locators.nth(index).evaluate(
                           "e => !!e.closest('nav, aside, [role=navigation], .catalog, .course-outline')")]
             if blocks:
-                return blocks
+                blocks = [block for block in blocks if not self._completed_video_region(block)]
+                if blocks:
+                    return blocks
         containers = root.locator("div, section, article, fieldset, li")
         indices = containers.evaluate_all(r"""elements => {
             const marker=/(?:单选|多选|判断)题/;
@@ -1805,7 +2278,8 @@ class BrowserSession:
             return matches.filter(item=>!matches.some(other=>other!==item
                 && item.element.contains(other.element))).slice(0,200).map(item=>item.index);
         }""")
-        return [containers.nth(index) for index in indices if self._visible(containers.nth(index))]
+        return [containers.nth(index) for index in indices if self._visible(containers.nth(index))
+                and not self._completed_video_region(containers.nth(index))]
 
     def _has_quiz(self) -> bool:
         return any(self._question_blocks(frame) for frame in self._frames() if self._frame_visible(frame))
@@ -2205,8 +2679,6 @@ class BrowserSession:
             self._wait(0.25)
         if kind == "quiz" and not content_ready:
             raise BrowserError("已检测到答题内容，但未能完整读取题干和选项，请检查页面是否加载完成。")
-        if kind == "video" and not content_ready:
-            raise BrowserError("已检测到视频播放器，但媒体来源尚未加载，请检查页面是否加载完成。")
         raise BrowserError("点击下一节后章节没有变化，已停止以防循环。")
 
     def capture_diagnostic(self) -> Path | None:
@@ -2225,6 +2697,8 @@ class BrowserSession:
         if self._owner_thread is not None and self._owner_thread != threading.get_ident():
             raise BrowserError("请在浏览器工作线程中关闭浏览器。")
         self._clear_content_nodes()
+        self._clear_task_regions()
+        self._clear_pointer_guards()
         # Stop only cancels course actions. The last checkpoint must still run
         # before Chromium closes, while its session cookies remain readable.
         self._checkpoint_cookies(force=True)

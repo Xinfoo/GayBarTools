@@ -27,11 +27,15 @@ class Workflow:
         if self.stop_event.is_set():
             raise WorkflowStopped("已停止，浏览器保留在当前页面。")
 
-    def _solve_video_quiz(self, questions: list[Question], screenshot: bytes | None) -> list[Answer]:
+    def _solve_video_quiz(self, questions: list[Question], screenshot: bytes | None, *,
+                          video_quiz_feedback: str | None = None) -> list[Answer]:
         self.check_stop()
         self.state(f"识别并解答视频插入题（{len(questions)} 道）")
         self.log("视频出现插入题，正在调用模型作答。")
-        answers = self.solver.solve(questions, screenshot)
+        if video_quiz_feedback:
+            answers = self.solver.solve(questions, screenshot, video_quiz_feedback=video_quiz_feedback)
+        else:
+            answers = self.solver.solve(questions, screenshot)
         self.check_stop()
         self.state("视频播放与插入题处理中")
         return answers
