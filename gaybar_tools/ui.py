@@ -24,9 +24,14 @@ class Application:
         self.state = tk.StringVar(value="本地演示 · 无需账号或 API" if demo_url else "打开浏览器，登录后进入任意课程章节")
         self.url = tk.StringVar(value="尚未打开浏览器")
         root.title("GayBarTools · 学习通章节助手" + (" · 本地演示" if demo_url else ""))
-        root.geometry("960x820")
-        root.minsize(820, 720)
         self.build()
+        # Measure after fonts/layout settle so the log's nine rows remain
+        # visible at different desktop scaling settings.
+        root.update_idletasks()
+        width = min(max(1200, root.winfo_reqwidth()), max(1, root.winfo_screenwidth() - 80))
+        height = min(max(1100, root.winfo_reqheight()), max(1, root.winfo_screenheight() - 100))
+        root.geometry(f"{width}x{height}")
+        root.minsize(min(820, width), min(720, height))
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.worker.start()
         root.after(100, self.drain)
