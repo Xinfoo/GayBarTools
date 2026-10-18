@@ -119,6 +119,7 @@ class BrowserSession:
         self._question_controls: dict[str, dict[str, Any]] = {}
         self._questions: dict[str, Question] = {}
         self._quiz_view_rows: dict[Any, tuple[float, list[Any]]] = {}
+        self._quiz_target: Any = None
         self._content_nodes: list[tuple[Any, float, Any, str]] = []
         self._content_sequence = 0
         self._task_regions: list[dict[str, Any]] = []
@@ -640,7 +641,7 @@ class BrowserSession:
         """
         parts: list[Any] = []
         ready = True
-        if kind in {"video", "document"}:
+        if kind in {"video", "document", "mixed"}:
             # The page identity describes all of its content even when its
             # first recognised kind is video. Use structural order for this
             # stable signature, rather than viewport/scroll coordinates.
@@ -653,8 +654,16 @@ class BrowserSession:
                     if task.completed or not task.required:
                         continue
                     if task.placeholder:
+                        if task.kind == "quiz" and self._unpublished_quiz(task.target):
+                            continue
                         pending_ready[task.identity] = False
                         continue
+                if task.kind == "quiz":
+                    rows, quiz_ready = self._quiz_material(task.target)
+                    if not task.region:
+                        parts.append(("quiz", rows))
+                    pending_ready[task.identity] = quiz_ready
+                    continue
                 if task.kind == "video":
                     state = task.target.evaluate("""e => ({
                         source:e.getAttribute('src') ||
@@ -692,22 +701,9 @@ class BrowserSession:
                 if submitted and cached and cached[0] == origin:
                     parts.append(("quiz", cached[1]))
                     continue
-                rows: list[Any] = []
-                for block in self._question_blocks(frame):
-                    title = block.locator(_QUESTION_TITLES)
-                    stem = _clean(title.first.inner_text(timeout=1000)) if title.count() else ""
-                    if not stem:
-                        stem = _clean(block.inner_text(timeout=1000).splitlines()[0])
-                    identity = block.get_attribute("data-question-id") or block.get_attribute("data-id") or block.get_attribute("id") or ""
-                    if stem:
-                        # Reused question IDs/titles can still carry a new
-                        # set of choices. Selection flags are excluded.
-                        options = [_clean(control.inner_text(timeout=1000)) or
-                                   control.get_attribute("aria-label") or control.get_attribute("value") or ""
-                                   for control in self._option_candidates(block)]
-                        rows.append((identity, stem, options))
-                        ready = ready and (submitted or len(options) >= 2)
+                rows, questions_ready = self._quiz_rows(frame)
                 if rows:
+                    ready = ready and (submitted or questions_ready)
                     self._quiz_view_rows[frame] = (origin, rows)
                     parts.append(("quiz", rows))
                 elif submitted:
@@ -771,9 +767,9 @@ class BrowserSession:
         processed page must still be caught by Workflow's visited set.
         """
         tokens = []
-        if kind in {"video", "document"}:
+        if kind in {"video", "document", "mixed"}:
             videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
-            roots = videos + self._document_targets()
+            roots = videos + self._document_targets() + self._chapter_quiz_targets()
         elif kind == "quiz":
             roots = []
             for frame in self._frames():
@@ -818,6 +814,13 @@ class BrowserSession:
 
     def chapter_kind(self) -> str:
         self._guard()
+        tasks = self.content_tasks()
+        quizzes = [task for task in tasks if task.kind == "quiz"]
+        if any(task.region and task.placeholder for task in quizzes):
+            return "mixed"
+        if (len(quizzes) > 1 or (any(task.region for task in quizzes)
+                and any(task.kind in {"video", "document"} for task in tasks))):
+            return "mixed"
         videos = self._video_locators()
         if videos:
             # Completed/optional players must not mask a separate assessment.
@@ -981,6 +984,8 @@ class BrowserSession:
                             .filter(v=>v.closest('.ans-attach-ct')===card)
                             .map(v=>[normalize(v.getAttribute('src')||v.currentSrc||''),v.getAttribute('poster')||'']);
                     }""")
+                elif state["kind"] == "quiz":
+                    inner, _ready = self._quiz_material(target)
                 else:
                     scope = target.evaluate_handle("e => e.closest('.ans-attach-ct') || document.body")
                     try:
@@ -1105,18 +1110,161 @@ class BrowserSession:
         finally:
             handle.dispose()
 
+    def _assessment_target(self, block: Any) -> Any:
+        owner = block.locator("xpath=ancestor-or-self::*[contains(concat(' ',normalize-space(@class),' '),"
+                              "' ans-attach-ct ') or @data-chapter-quiz][1]")
+        if owner.count():
+            return owner.first
+        return self._video_frame(block).locator("body")
+
+    def _chapter_quiz_targets(self) -> list[Any]:
+        targets: dict[str, Any] = {}
+        for frame in self._frames():
+            if not self._frame_visible(frame):
+                continue
+            blocks = self._question_blocks(frame)
+            for block in blocks:
+                target = self._assessment_target(block)
+                targets[self._content_identity(target, "quiz")] = target
+            if self._frame_result_visible(frame):
+                results = frame.locator(".submit-success, #submission-result, .answerResult, .workStatus, .Py_answer, .mark_answer")
+                found = False
+                for index in range(min(results.count(), 60)):
+                    result = results.nth(index)
+                    if not self._visible(result):
+                        continue
+                    target = self._assessment_target(result)
+                    targets[self._content_identity(target, "quiz")] = target
+                    found = True
+                if not blocks and not found:
+                    target = frame.locator("body")
+                    targets[self._content_identity(target, "quiz")] = target
+        return list(targets.values())
+
+    def _quiz_roots_for(self, target: Any) -> list[Any]:
+        roots = [target]
+        handle = target.element_handle(timeout=1500)
+        if handle is None:
+            raise BrowserError("章节测验区域已发生变化。")
+        try:
+            owner = handle.owner_frame()
+            for frame in self._frames():
+                ancestor = frame
+                while ancestor.parent_frame is not None and ancestor.parent_frame is not owner:
+                    ancestor = ancestor.parent_frame
+                if ancestor.parent_frame is owner:
+                    element = ancestor.frame_element()
+                    try:
+                        if handle.evaluate("(root,child) => root===child || root.contains(child)", element):
+                            roots.append(frame)
+                    finally:
+                        element.dispose()
+        finally:
+            handle.dispose()
+        return roots
+
+    def _quiz_roots(self) -> list[Any]:
+        return self._quiz_roots_for(self._quiz_target) if self._quiz_target is not None else self._frames()
+
+    @staticmethod
+    def _quiz_root_visible(root: Any) -> bool:
+        if getattr(root, "element_handle", None) is not None:
+            return BrowserSession._visible(root)
+        return BrowserSession._frame_visible(root)
+
+    @contextmanager
+    def quiz_scope(self, target: Any) -> Iterator[None]:
+        previous = self._quiz_target
+        old_questions, old_controls = self._questions, self._question_controls
+        self._quiz_target = target
+        try:
+            yield
+        finally:
+            self._quiz_target = previous
+            self._questions, self._question_controls = old_questions, old_controls
+
+    def _quiz_rows(self, root: Any) -> tuple[list[Any], bool]:
+        rows, ready = [], True
+        for block in self._question_blocks(root):
+            title = block.locator(_QUESTION_TITLES)
+            stem = _clean(title.first.inner_text(timeout=1000)) if title.count() else ""
+            if not stem:
+                stem = _clean(block.inner_text(timeout=1000).splitlines()[0])
+            identity = block.get_attribute("data-question-id") or block.get_attribute("data-id") or block.get_attribute("id") or ""
+            if not stem:
+                ready = False
+                continue
+            if re.search(r"填空题|简答题", stem):
+                count = len(self._text_answer_controls(block))
+                rows.append((identity, stem, "text", count))
+                ready = ready and count > 0
+            else:
+                options = [_clean(control.inner_text(timeout=1000)) or
+                           control.get_attribute("aria-label") or control.get_attribute("value") or ""
+                           for control in self._option_candidates(block)]
+                rows.append((identity, stem, options))
+                ready = ready and len(options) >= 2
+        return rows, bool(rows) and ready
+
+    def _quiz_material(self, target: Any) -> tuple[list[Any], bool]:
+        frame = self._video_frame(target)
+        origin = frame.evaluate("performance.timeOrigin")
+        path = target.evaluate("""e => {
+            const path=[];
+            for(let node=e;node&&node.parentElement;node=node.parentElement)
+                path.unshift([...node.parentElement.children].indexOf(node));
+            return path;
+        }""")
+        # ContentTask identities are reset between runs. Retain assessment
+        # rows across those resets and after submission replaces its fields.
+        key = (frame, "quiz-root", tuple(path))
+        cached = self._quiz_view_rows.get(key)
+        submitted = self._frame_result_visible(target)
+        if submitted and cached and cached[0] == origin:
+            return cached[1], True
+        rows, ready = self._quiz_rows(target)
+        if rows:
+            self._quiz_view_rows[key] = (origin, rows)
+        elif submitted:
+            rows = cached[1] if cached and cached[0] == origin else ["quiz-result"]
+        return rows, submitted or ready
+
+    def _unpublished_quiz(self, target: Any) -> bool:
+        owner = self._task_region(target)
+        if owner is not None:
+            region, _frame = owner
+            try:
+                if re.search(r"教师.{0,8}(?:未创建|未完成|尚未发布)|测验尚未发布",
+                             region.evaluate("e => e.innerText || ''")):
+                    return True
+            finally:
+                region.dispose()
+        for root in self._quiz_roots_for(target):
+            body = root if getattr(root, "element_handle", None) is not None else root.locator("body")
+            if re.search(r"教师.{0,8}(?:未创建|未完成|尚未发布)|测验尚未发布", body.inner_text(timeout=1500)):
+                return True
+        return False
+
     def content_tasks(self, *, include_occluded: bool = False) -> list[ContentTask]:
-        """Discover every mounted document/player, in visible page order."""
+        """Discover mounted media, readers and assessments in page order."""
         self._guard()
         tasks = []
         videos = self._video_locators(include_occluded=True) if include_occluded else self._video_locators()
-        for kind, targets in (("video", videos),
-                              ("document", self._document_targets())):
+        documents = self._document_targets()
+        for kind, targets in (("video", videos), ("document", documents),
+                              ("quiz", self._chapter_quiz_targets())):
             for target in targets:
                 identity = self._content_identity(target, kind)
                 region = self._task_region_info(target)
+                if kind == "quiz" and not region and (videos or documents):
+                    # Unowned questions near a generic player can be unrelated
+                    # examples/decoys. Only identified attachment assessments
+                    # join that page's ordered work; legacy standalone quiz
+                    # recognition still handles the next assessment view.
+                    continue
+                submitted = kind == "quiz" and self._frame_result_visible(target)
                 tasks.append(ContentTask(kind, target, identity, self._content_order(target),
-                    completed=bool(region and region["completed"]), region=region["descriptor"] if region else "",
+                    completed=submitted or bool(region and region["completed"]), region=region["descriptor"] if region else "",
                     required=region["required"] if region else True))
         known_regions = {task.region for task in tasks if task.region}
         for frame in self._frames():
@@ -1128,7 +1276,7 @@ class BrowserSession:
                 if not self._visible(anchor) or not self._video_visible(anchor):
                     continue
                 region = self._task_region_info(anchor, placeholder=True)
-                if not region or region["kind"] == "quiz" or region["descriptor"] in known_regions:
+                if not region or region["descriptor"] in known_regions:
                     continue
                 kind = region["kind"]
                 tasks.append(ContentTask(kind, anchor, self._content_identity(anchor, kind),
@@ -1141,7 +1289,8 @@ class BrowserSession:
 
     def process_content(self, *,
                         on_quiz: VideoQuizSolver | None = None,
-                        on_task: Callable[[str, int, int], None] | None = None) -> int:
+                        on_chapter_quiz: Callable[[], bool] | None = None,
+                        on_task: Callable[[str, int, int], None] | None = None) -> int | None:
         """Finish this page's content from top to bottom before navigation."""
         self._clear_content_nodes()
         completed: set[str] = set()
@@ -1167,6 +1316,8 @@ class BrowserSession:
                     stable_end = 0
                     task = pending[0]
                     skip_reason = self._task_skip_reason(task.target)
+                    if task.completed and not skip_reason:
+                        skip_reason = "测验已提交"
                     if skip_reason:
                         completed.add(task.identity)
                         if skip_reason == "未标记为任务点":
@@ -1182,6 +1333,11 @@ class BrowserSession:
                         self._wait(max(0.4, float(self.settings.poll_interval)))
                         continue
                     if task.placeholder:
+                        if task.kind == "quiz" and self._unpublished_quiz(task.target):
+                            completed.add(task.identity)
+                            skipped += 1
+                            self.log("教师尚未创建或发布该测验，跳过此任务区域。")
+                            continue
                         if not unresolved_since:
                             unresolved_since = time.monotonic()
                         if time.monotonic() - unresolved_since >= self.NEXT_PAGE_TIMEOUT:
@@ -1200,13 +1356,20 @@ class BrowserSession:
                         skipped += 1
                         self.log(f"本区域{skip_reason}，跳过视频播放或静态阅读。")
                         continue
-                    self.log(f"按页面顺序处理第 {number} 个任务：{'视频' if task.kind == 'video' else '静态阅读'}。")
+                    action = {"video": "视频", "document": "静态阅读", "quiz": "章节测验"}[task.kind]
+                    self.log(f"按页面顺序处理第 {number} 个任务：{action}。")
                     if task.kind == "video":
                         try:
                             self._watch_video_targets([task.target], on_quiz)
                         except Exception:
                             self._pause_video_on_stop()
                             raise
+                    elif task.kind == "quiz":
+                        if on_chapter_quiz is None:
+                            raise BrowserError("当前页面包含章节测验，需要通过完整学习流程处理。")
+                        with self.quiz_scope(task.target):
+                            if not on_chapter_quiz():
+                                return None  # Filled for manual submission; do not advance.
                     else:
                         self._read_document_targets([task.target])
                     completed.add(task.identity)
@@ -2296,18 +2459,20 @@ class BrowserSession:
                       and not locators.nth(index).evaluate(
                           "e => !!e.closest('nav, aside, [role=navigation], .catalog, .course-outline')")]
             if blocks:
-                blocks = [block for block in blocks if not self._inactive_video_region(block)]
+                blocks = [block for block in blocks if self._chapter_question(block)]
                 if blocks:
                     return blocks
         containers = root.locator("div, section, article, fieldset, li")
         indices = containers.evaluate_all(r"""elements => {
-            const marker=/(?:单选|多选|判断)题/;
-            const controls='input[type=radio], input[type=checkbox], [role=radio], [role=checkbox]';
+            const marker=/(?:单选|多选|判断|填空|简答)题/;
+            const choices='input[type=radio], input[type=checkbox], [role=radio], [role=checkbox]';
+            const texts='textarea, input:not([type]), input[type=text], [contenteditable=true], iframe, .blankItemInp';
             const titles='.Zy_TItle, .question-title, .questionTitle, .stem, legend, .mark_name, .qtContent, h2, h3, h4';
             const matches=elements.map((e,index)=>{
                 if(e.closest('nav, aside, [role=navigation], .catalog, .course-outline'))return null;
-                if(e.querySelectorAll(controls).length<2)return null;
                 const text=(e.innerText||'').trim();
+                if(e.querySelectorAll(choices).length<2
+                    && !(/(?:填空|简答)题/.test(text) && e.querySelector(texts)))return null;
                 const title=e.querySelector(titles);
                 if(!marker.test(text) && !(title && title.innerText.trim()))return null;
                 return {element:e,index};
@@ -2318,7 +2483,21 @@ class BrowserSession:
                 && item.element.contains(other.element))).slice(0,200).map(item=>item.index);
         }""")
         return [containers.nth(index) for index in indices if self._visible(containers.nth(index))
-                and not self._inactive_video_region(containers.nth(index))]
+                and self._chapter_question(containers.nth(index))]
+
+    def _chapter_question(self, block: Any) -> bool:
+        state = self._task_marker_state(block)
+        if state and state["kind"] == "video":
+            return False
+        if block.evaluate("""e => !!e.closest('.video-js, .video-stage, .ans-video, .ans-video-player, '
+            + '.video-player, [data-video-quiz], .ans-videoquiz, #videoquiz, .video-quiz, .videoquiz')"""):
+            return False
+        frame = self._video_frame(block)
+        while frame is not None:
+            if re.search(r"/modules/video/", urlparse(frame.url).path, re.I):
+                return False
+            frame = frame.parent_frame
+        return True
 
     def _has_quiz(self) -> bool:
         return any(self._question_blocks(frame) for frame in self._frames() if self._frame_visible(frame))
@@ -2354,7 +2533,89 @@ class BrowserSession:
                 and (video is None or self._overlaps_video(inputs.nth(index).bounding_box(timeout=1000), video_box))]
 
     def get_questions(self) -> list[Question]:
-        return self._extract_questions(self._frames())
+        return self._extract_questions(self._quiz_roots())
+
+    def _text_answer_controls(self, block: Any, *, _inside_blank: bool = False) -> list[Any]:
+        """Read the editable fields, including UEditor's visible iframe body.
+
+        Editor toolbars and hidden serialization textareas are not answer
+        fields. Returning actual locators keeps typing on the browser's native
+        input path instead of invoking an editor API or changing DOM values.
+        """
+        selector = (".blankItemInp, input:not([type]), input[type=text], textarea, "
+                    "[contenteditable=true], [contenteditable=plaintext-only], iframe")
+        excluded = ("[role=toolbar], .edui-toolbar, .edui-dialog-container, "
+                    ".edui-popup, .tox-toolbar, .tox-dialog, .cke_top, .cke_bottom")
+
+        def collect(root: Any, depth: int = 0) -> list[Any]:
+            fields: list[Any] = []
+            candidates = root.locator(selector)
+            for index in range(min(candidates.count(), 100)):
+                self._check_stop()
+                control = candidates.nth(index)
+                if not self._visible(control) or control.evaluate(
+                        "(e, excluded) => !!e.closest(excluded)", excluded):
+                    continue
+                if control.evaluate("e => e.matches('.blankItemInp')"):
+                    # Multi-blank UEditor questions initially expose a display
+                    # div. Clicking it activates that blank's hidden editor
+                    # and can hide all other editors. Cache the stable wrapper
+                    # so extraction needs no clicks and later blanks survive.
+                    if control.locator(".InpDIV").count() and control.locator(".textDIV").count():
+                        fields.append(control)
+                    continue
+                if not _inside_blank and control.evaluate("e => !!e.closest('.blankItemInp')"):
+                    continue
+                if control.evaluate("e => e.tagName === 'IFRAME'"):
+                    if depth >= 4:
+                        continue
+                    handle = control.element_handle(timeout=1500)
+                    if handle is None:
+                        continue
+                    try:
+                        frame = handle.content_frame()
+                    finally:
+                        handle.dispose()
+                    if frame is not None:
+                        fields.extend(collect(frame, depth + 1))
+                    continue
+                if not control.is_editable(timeout=1500):
+                    continue
+                # A nested editable is part of its outer editor, not another
+                # blank. Native inputs embedded in that editor follow suit.
+                if control.evaluate("""e => !!e.parentElement?.closest(
+                        '[contenteditable=true], [contenteditable=plaintext-only]')"""):
+                    continue
+                fields.append(control)
+            return fields
+
+        return collect(block)
+
+    def _resolve_text_answer_control(self, control: Any) -> Any:
+        if not control.evaluate("e => e.matches('.blankItemInp')"):
+            return control
+        display = control.locator(".InpDIV").first
+        if self._visible(display):
+            self._click(display)
+        deadline = time.monotonic() + 5
+        while True:
+            self._guard()
+            fields = self._text_answer_controls(control.locator(".textDIV"), _inside_blank=True)
+            if len(fields) == 1:
+                return fields[0]
+            if time.monotonic() >= deadline:
+                raise BrowserError("点击填空区域后未找到可编辑的文本框。")
+            self._wait(.1)
+
+    @staticmethod
+    def _answer_text(value: str, *, rich: bool = False) -> str:
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        if rich:
+            # Chromium turns inserted newlines into editor paragraphs. Their
+            # rendered innerText can contain two breaks for one paragraph
+            # boundary, so compare the text without paragraph spacing.
+            value = re.sub(r"\n{2,}", "\n", value).rstrip("\n")
+        return value
 
     def _extract_questions(self, roots: list[Any], *, video: Any = None) -> list[Question]:
         self._guard()
@@ -2362,7 +2623,7 @@ class BrowserSession:
         self._questions = {}
         questions: list[Question] = []
         for frame_number, frame in enumerate(roots):
-            if video is None and not self._frame_visible(frame):
+            if video is None and not self._quiz_root_visible(frame):
                 continue
             blocks: list[Any] = []
             if video is not None:
@@ -2375,16 +2636,39 @@ class BrowserSession:
                 text = _clean(raw_text)
                 if not text:
                     continue
+                title = block.locator(_VIDEO_TITLES if video is not None else _QUESTION_TITLES)
+                stem = _clean(title.first.inner_text(timeout=1500)) if title.count() else (
+                    text if video is not None else _clean(raw_text.splitlines()[0]))
+                text_kind = re.search(r"(?:\[|【)\s*(填空|简答)题\s*(?:\]|】)|"
+                                      r"^(?:\d+[.、．:：)）]?\s*)?(填空|简答)题(?:\s|[:：])", stem)
+                if text_kind and video is not None:
+                    raise BrowserError("视频插题目前仅支持单选、多选和判断。")
+                if text_kind:
+                    kind = "fill" if "填空" in text_kind.group() else "short"
+                    fields = self._text_answer_controls(block)
+                    if not fields or (kind == "short" and len(fields) != 1):
+                        raise BrowserError("文本题的作答区域尚未完整加载或无法识别。")
+                    question_id = (block.get_attribute("data-question-id") or block.get_attribute("data-id")
+                                   or block.get_attribute("id") or f"f{frame_number}-q{index + 1}")
+                    if question_id in self._questions:
+                        question_id = f"f{frame_number}-{question_id}"
+                    question = Question(id=question_id, text=stem, kind=kind, options=(),
+                                        blank_count=len(fields) if kind == "fill" else 0)
+                    questions.append(question)
+                    self._questions[question_id] = question
+                    self._question_controls[question_id] = {
+                        str(field_index + 1): field for field_index, field in enumerate(fields)
+                    }
+                    continue
                 if re.search(r"\[(?:填空|简答|论述|连线|排序|阅读|计算)题\]|【(?:填空|简答|论述)题】", text):
-                    raise BrowserError("检测到尚不支持的题型；只支持单选、多选和判断。")
+                    if video is not None:
+                        raise BrowserError("视频插题目前仅支持单选、多选和判断。")
+                    raise BrowserError("检测到尚不支持的题型；章节测验支持单选、多选、判断、填空和简答。")
                 candidates = self._option_candidates(block, video_quiz=video is not None, video=video)
                 if not candidates:
                     if _RESULT.search(text):
                         continue
                     raise BrowserError("题目没有可可靠识别的选项控件，请人工查看诊断截图。")
-                title = block.locator(_VIDEO_TITLES if video is not None else _QUESTION_TITLES)
-                stem = _clean(title.first.inner_text(timeout=1500)) if title.count() else (
-                    text if video is not None else _clean(raw_text.splitlines()[0]))
                 kind = "multiple" if "多选" in stem else "boolean" if "判断" in stem else "single"
                 if block.locator("input[type=checkbox], [role=checkbox]").count():
                     kind = "multiple"
@@ -2422,6 +2706,8 @@ class BrowserSession:
 
     def quiz_screenshot(self) -> bytes:
         self._guard()
+        if self._quiz_target is not None:
+            return self._quiz_target.screenshot(type="png", timeout=10000)
         return self._page.screenshot(type="png", full_page=True, timeout=10000)
 
     @staticmethod
@@ -2444,7 +2730,17 @@ class BrowserSession:
         if len(mapped) != len(answers) or set(mapped) != set(self._questions):
             raise BrowserError("答案与当前题目不完整对应，已停止填写。")
         for question_id, question in self._questions.items():
-            choices = tuple(str(choice).strip().upper() for choice in mapped[question_id].choices)
+            answer = mapped[question_id]
+            if question.kind in {"fill", "short"}:
+                expected = question.blank_count if question.kind == "fill" else 1
+                if (answer.choices or expected < 1 or len(answer.texts) != expected
+                        or len(self._question_controls[question_id]) != expected
+                        or any(not isinstance(text, str) or not text.strip() for text in answer.texts)):
+                    raise BrowserError(f"题目 {question_id} 的文本答案与作答区域不完整对应。")
+                continue
+            if answer.texts:
+                raise BrowserError(f"题目 {question_id} 应使用选项答案。")
+            choices = tuple(str(choice).strip().upper() for choice in answer.choices)
             if not choices or len(set(choices)) != len(choices):
                 raise BrowserError(f"题目 {question_id} 的答案为空或重复。")
             if question.kind != "multiple" and len(choices) != 1:
@@ -2456,6 +2752,22 @@ class BrowserSession:
         self._validate_answers(answers)
         mapped = {answer.question_id: answer for answer in answers}
         for question_id, question in self._questions.items():
+            if question.kind in {"fill", "short"}:
+                for control, text in zip(self._question_controls[question_id].values(), mapped[question_id].texts):
+                    self._guard()
+                    control = self._resolve_text_answer_control(control)
+                    self._guard()
+                    self._click(control)
+                    self._guard()
+                    control.press("ControlOrMeta+A", timeout=3000)
+                    self._guard()
+                    self._page.keyboard.insert_text(text)
+                    self._guard()
+                    actual = control.evaluate("e => ({text: 'value' in e ? e.value : e.innerText, rich: !('value' in e)})")
+                    if self._answer_text(actual["text"], rich=actual["rich"]) != self._answer_text(text, rich=actual["rich"]):
+                        raise BrowserError(f"无法确认题目 {question_id} 的文本答案已完整填写。")
+                self.log(f"已填写题目 {question_id}：{len(mapped[question_id].texts)} 个文本区域")
+                continue
             desired = {str(choice).strip().upper() for choice in mapped[question_id].choices}
             for label, control in self._question_controls[question_id].items():
                 self._guard()
@@ -2474,7 +2786,7 @@ class BrowserSession:
             self.log(f"已填写题目 {question_id}：{', '.join(sorted(desired))}")
 
     def _result_visible(self) -> bool:
-        return any(self._frame_result_visible(frame) for frame in self._frames())
+        return any(self._frame_result_visible(frame) for frame in self._quiz_roots())
 
     def _frame_result_visible(self, frame: Any) -> bool:
         if not self._frame_visible(frame):
@@ -2485,8 +2797,10 @@ class BrowserSession:
             quiz_structure = frame.locator(
                 ".TiMu, [data-question-id], .Zy_TItle, .Py_answer, .mark_answer, "
                 "#submission-result, .submit-success, .answerResult, #workForm, .workForm")
-            if not quiz_structure.count() and not re.search(
-                    r"(?:quiz|/work/|homework|exam|doHomeWork)", urlparse(frame.url).path, re.I):
+            url = getattr(frame, "url", "")
+            scoped = getattr(frame, "element_handle", None) is not None
+            if not quiz_structure.count() and not scoped and not re.search(
+                    r"(?:quiz|/work/|homework|exam|doHomeWork)", urlparse(url).path, re.I):
                 return False
             # A plain status node is useful only within the identified quiz.
             nodes = frame.locator(
@@ -2503,6 +2817,37 @@ class BrowserSession:
             if any(self._visible(answers.nth(i)) for i in range(min(answers.count(), 30))):
                 if any(self._visible(scores.nth(i)) for i in range(min(scores.count(), 30))):
                     return True
+            # doHomeWorkNew renders per-question grades as a bare number and
+            # "分", without a score label. Match its read-only answer structure
+            # so numbers quoted in stems/options cannot confirm submission.
+            graded = frame.locator(".newAnswerBx .myAnswerBx")
+            for index in range(min(graded.count(), 60)):
+                result = graded.nth(index)
+                if not self._visible(result):
+                    continue
+                labels = result.locator(".myAnswer .answerFont")
+                if not any(self._visible(labels.nth(i)) and re.match(
+                        r"^我的答案\s*[:：]", _clean(labels.nth(i).inner_text(timeout=800)))
+                        for i in range(min(labels.count(), 10))):
+                    continue
+                controls = result.locator(
+                    "input:not([type=hidden]), textarea, [contenteditable=true], [role=textbox]")
+                if any(self._visible(controls.nth(i)) for i in range(min(controls.count(), 30))):
+                    continue
+                grades = result.locator(".answerScore .scoreNum")
+                if any(self._visible(grades.nth(i)) and re.fullmatch(
+                        r"\d+(?:\.\d+)?", _clean(grades.nth(i).inner_text(timeout=800)))
+                        for i in range(min(grades.count(), 10))):
+                    return True
+                # A submitted text answer may await teacher grading. Read the
+                # assessment's status or this answer's grade area, not stems.
+                for review in (frame.locator(".newTestTitle .testTit_status"),
+                               result.locator(".answerScore")):
+                    if any(self._visible(review.nth(i)) and re.fullmatch(
+                            r"(?:待|等待)(?:批阅|批改|评分)",
+                            _clean(review.nth(i).inner_text(timeout=800)))
+                            for i in range(min(review.count(), 10))):
+                        return True
         except Exception:
             pass
         return False
@@ -2512,11 +2857,25 @@ class BrowserSession:
         self._guard()
         return self._result_visible()
 
+    def _quiz_dialog_roots(self) -> list[Any]:
+        if self._quiz_target is None:
+            return self._frames()
+        roots = []
+        frame = self._video_frame(self._quiz_target)
+        while frame is not None:
+            roots.append(frame)
+            frame = frame.parent_frame
+        return roots
+
     def submit_quiz(self) -> bool:
         self._guard()
         if self._result_visible():
             return True
-        submit = self._text_control(_SUBMIT)
+        submit = None
+        for root in self._quiz_roots():
+            submit = self._text_control(_SUBMIT, root=root)
+            if submit is not None:
+                break
         if submit is None:
             raise BrowserError("未找到可识别的提交按钮。")
         self._submitting = True
@@ -2529,7 +2888,7 @@ class BrowserSession:
                 if self._result_visible():
                     self.log("已确认测验提交结果。")
                     return True
-                for frame in self._frames():
+                for frame in self._quiz_dialog_roots():
                     dialogs = frame.locator("[role=dialog], .layui-layer, .layui-layer-dialog, .ant-modal, .el-message-box, .confirm-dialog, .popDiv")
                     for index in range(min(dialogs.count(), 15)):
                         dialog = dialogs.nth(index)
@@ -2685,7 +3044,7 @@ class BrowserSession:
             # tab. Explicit content recognition is sufficient after the click.
             chapter = self._chapter_identifier()
             changed = kind != previous_kind or signature != previous
-            if include_occluded and kind in {"video", "document"} and previous_kind in {"video", "document"}:
+            if include_occluded and kind in {"video", "document", "mixed"} and previous_kind in {"video", "document", "mixed"}:
                 changed = signature != previous
             if (content_ready and not changed and chapter != previous_chapter
                     and previous_documents):
@@ -2755,6 +3114,7 @@ class BrowserSession:
         self._question_controls.clear()
         self._questions.clear()
         self._quiz_view_rows.clear()
+        self._quiz_target = None
         try:
             try:
                 if context is not None:

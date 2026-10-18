@@ -12,7 +12,7 @@ from urllib.request import Request
 
 from gaybar_tools.config import AppSettings
 from gaybar_tools.llm import AnswerFormatError, QuizSolver, SolverCancelled, SolverError, _SameOriginRedirectHandler, _completion_url
-from gaybar_tools.models import Option, Question
+from gaybar_tools.models import Answer, Option, Question
 
 
 PNG = b"\x89PNG\r\n\x1a\nmock-screenshot"
@@ -54,6 +54,102 @@ class QuizSolverTests(unittest.TestCase):
     def test_judge_alias_and_single_correct_multiple_option(self):
         self.solve_with([answer()], [make_question(kind="judge")])
         self.solve_with([answer()], [make_question(kind="multiple")])
+
+    def test_mixed_choice_fill_and_short_answers_keep_dom_and_blank_order(self):
+        questions = [
+            make_question(),
+            Question("fill", "Complete the two blanks.", "fill", (), 2),
+            Question("short", "Explain the four areas.", "short", ()),
+        ]
+        result, mocked = self.solve_with([
+            {"question_id": "short", "texts": ["Complete response.\nSecond paragraph."]},
+            {"question_id": "fill", "choices": [], "texts": ["  first blank  ", "second blank"]},
+            {**answer(), "texts": []},
+        ], questions)
+        self.assertEqual([item.question_id for item in result], ["q1", "fill", "short"])
+        self.assertEqual(result[0], Answer("q1", ("A",)))
+        self.assertEqual(result[1], Answer("fill", (), "", ("first blank", "second blank")))
+        self.assertEqual(result[2].texts, ("Complete response.\nSecond paragraph.",))
+        self.assertEqual(result[2].choices, ())
+        messages = json.loads(mocked.call_args.args[0].data)["messages"]
+        extracted = json.loads(messages[1]["content"].split("\n", 1)[1])
+        self.assertNotIn("blank_count", extracted[0])
+        self.assertEqual(extracted[1]["blank_count"], 2)
+        self.assertEqual(extracted[2]["blank_count"], 1)
+        self.assertIn("plain text", messages[0]["content"])
+        self.assertIn("DOM order", messages[0]["content"])
+        self.assertIn("exactly one", messages[0]["content"])
+
+    def test_models_preserve_existing_positional_constructor_arguments(self):
+        question = make_question()
+        legacy_answer = Answer("q1", ("A",), "explanation")
+        self.assertEqual(question.blank_count, 0)
+        self.assertEqual(legacy_answer.reason, "explanation")
+        self.assertEqual(legacy_answer.texts, ())
+
+    def test_text_answer_shapes_reject_wrong_counts_empty_values_and_conflicts(self):
+        questions = [Question("fill", "Fill two blanks.", "fill", (), 2)]
+        invalid = [
+            {"question_id": "fill", "texts": ["only one"]},
+            {"question_id": "fill", "texts": ["one", "two", "three"]},
+            {"question_id": "fill", "texts": ["one", " \n "]},
+            {"question_id": "fill", "texts": ["one", 2]},
+            {"question_id": "fill", "texts": "one, two"},
+            {"question_id": "fill", "choices": []},
+            {"question_id": "fill", "texts": ["one", "two"], "choices": ["A"]},
+            {"question_id": "fill", "texts": ["one", "two"], "choices": None},
+        ]
+        indexed = {question.id: question for question in questions}
+        for item in invalid:
+            with self.subTest(item=item), self.assertRaises(AnswerFormatError):
+                self.solver._parse_answers(json.dumps({"answers": [item]}), indexed)
+        for texts in ([], ["one", "two"], [None], ["   "]):
+            with self.subTest(short_texts=texts), self.assertRaises(AnswerFormatError):
+                self.solver._parse_answers(
+                    json.dumps({"answers": [{"question_id": "short", "texts": texts}]}),
+                    {"short": Question("short", "Explain.", "short", (), 1)},
+                )
+        for texts in (["conflicting text"], None, ""):
+            with self.subTest(choice_texts=texts), self.assertRaises(AnswerFormatError):
+                self.solver._parse_answers(json.dumps({"answers": [{**answer(), "texts": texts}]}), {"q1": make_question()})
+
+    def test_text_format_retry_resends_full_mixed_evidence_and_recovers(self):
+        questions = [make_question(), Question("fill", "Two blanks.", "fill", (), 2)]
+        responses = [
+            api_response(json.dumps({"answers": [answer(), {"question_id": "fill", "texts": ["incomplete"]}]})),
+            api_response(json.dumps({"answers": [answer(), {"question_id": "fill", "texts": ["first", "second"]}]})),
+        ]
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses) as mocked:
+            result = self.solver.solve(questions, PNG)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(result[1].texts, ("first", "second"))
+        payloads = [json.loads(call.args[0].data) for call in mocked.call_args_list]
+        self.assertEqual(payloads[1]["messages"][1], payloads[0]["messages"][1])
+        self.assertIn("texts", payloads[1]["messages"][2]["content"])
+        self.assertIn("blank_count", payloads[1]["messages"][2]["content"])
+
+    def test_text_format_failure_still_has_only_three_extra_retries(self):
+        incomplete = json.dumps({"answers": [{"question_id": "fill", "texts": ["one"]}]})
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(incomplete)) as mocked:
+            with self.assertRaisesRegex(AnswerFormatError, "重试 3 次"):
+                self.solver.solve([Question("fill", "Two blanks.", "fill", (), 2)])
+        self.assertEqual(mocked.call_count, 4)
+
+    def test_invalid_text_question_metadata_is_rejected_before_network(self):
+        invalid = [
+            Question("fill", "Fill.", "fill", ()),
+            Question("fill", "Fill.", "fill", (), -1),
+            Question("fill", "Fill.", "fill", (), True),
+            Question("fill", "Fill.", "fill", (), 1.5),
+            Question("fill", "Fill.", "fill", make_question().options, 1),
+            Question("short", "Explain.", "short", (), 2),
+            Question("short", "Explain.", "short", (), False),
+        ]
+        with patch("gaybar_tools.llm.request.OpenerDirector.open") as mocked:
+            for question in invalid:
+                with self.subTest(question=question), self.assertRaises(SolverError):
+                    self.solver.solve([question])
+            mocked.assert_not_called()
 
     def test_request_fuses_dom_and_base64_screenshot_without_local_key(self):
         result, mocked = self.solve_with([answer()], screenshot=PNG)

@@ -253,7 +253,7 @@ class NonTaskResourcesIntegrationTests(unittest.TestCase):
         assessment = self.browser.page.frame_locator("#chapter-quiz")
         assessment.locator("#question-1").wait_for(state="visible")
 
-        self.assertEqual(self.browser.prepare_start(), "quiz")
+        self.assertEqual(self.browser.prepare_start(), "mixed")
         questions = self.browser.get_questions()
 
         self.assertEqual(len(questions), 3)
