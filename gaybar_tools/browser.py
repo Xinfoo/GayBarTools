@@ -286,6 +286,10 @@ class BrowserSession:
     # only needs to let footer/lazy content mount; waiting a full
     # poll_interval here added several seconds to every page.
     CONTENT_SETTLE = 0.5
+    # Document bottoms still need several observations so that lazy pages can
+    # grow, but the interval is independent of poll_interval.
+    DOCUMENT_BOTTOM_SETTLE = 1.5
+    DOCUMENT_BOTTOM_WAIT = 0.5
 
     def __init__(self, settings: AppSettings, paths: AppPaths,
                  log: Callable[[str], None], stop_event: threading.Event) -> None:
@@ -3004,10 +3008,10 @@ class BrowserSession:
                         if signature != bottom_signature:
                             bottom_signature, bottom_since, bottom_reads = signature, time.monotonic(), 0
                         bottom_reads += 1
-                        settle = max(1.2, 2 * max(0.4, float(self.settings.poll_interval)))
-                        if bottom_reads >= 3 and time.monotonic() - bottom_since >= settle:
+                        if (bottom_reads >= 3
+                                and time.monotonic() - bottom_since >= self.DOCUMENT_BOTTOM_SETTLE):
                             break
-                        self._wait(max(0.4, float(self.settings.poll_interval)))
+                        self._wait(self.DOCUMENT_BOTTOM_WAIT)
                         continue
                     bottom_reads, bottom_since, bottom_signature = 0, 0.0, None
                     if abs(metrics["top"] - previous_top) < 1:
