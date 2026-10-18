@@ -282,6 +282,10 @@ class BrowserSession:
     VIDEO_QUIZ_POLL_INTERVAL = 0.2
     NEXT_PAGE_TIMEOUT = 20.0
     NEXT_PAGE_SETTLE = 0.5
+    # A completed page is confirmed by two clean scans. The gap between them
+    # only needs to let footer/lazy content mount; waiting a full
+    # poll_interval here added several seconds to every page.
+    CONTENT_SETTLE = 0.5
 
     def __init__(self, settings: AppSettings, paths: AppPaths,
                  log: Callable[[str], None], stop_event: threading.Event) -> None:
@@ -1872,7 +1876,7 @@ class BrowserSession:
                     footer.scroll_into_view_if_needed(timeout=2000)
                 else:
                     self._page.locator("body").press("Control+End", timeout=2000)
-                self._wait(max(0.4, float(self.settings.poll_interval)))
+                self._wait(self.CONTENT_SETTLE)
                 if not unresolved_since:
                     stable_end += 1
                 if stable_end >= 2:
