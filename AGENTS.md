@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`gaybar_tools/` contains the Python application: `browser.py` adapts webpages, `workflow.py` coordinates learning pages, `llm.py` handles model requests and answer validation, and `ui.py`/`worker.py` connect Tkinter to browser automation. Configuration, cookies, paths, and filesystem isolation have separate modules.
+`gaybar_tools/` contains the Python application: `browser.py` adapts webpages, `workflow.py` coordinates learning pages, `llm.py` handles model requests and answer validation, and `ui.py`/`worker.py` connect the PySide6 / Qt interface to browser automation. Configuration, cookies, paths, and filesystem isolation have separate modules.
 
 `gaybar_tools/demo/` holds packaged HTML, JavaScript, CSS, and media fixtures. `tests/` contains unit and browser integration tests. Read [docs/HOW_AGENT_TO_BUILD.md](docs/HOW_AGENT_TO_BUILD.md) for requirements and [docs/VIDEO_NOTES.md](docs/VIDEO_NOTES.md) for validation boundaries.
 
@@ -23,7 +23,7 @@ Windows equivalents are `py scripts\bootstrap.py`, `run.bat`, and `.venv\Scripts
 
 Use four-space indentation, `snake_case` for functions/modules, `PascalCase` for classes, and `UPPER_SNAKE_CASE` for constants. Follow existing type hints and dataclasses. No formatter or linter is configured; match surrounding code.
 
-Keep synchronous Playwright objects on their owning worker thread and communicate with Tkinter through queues. Preserve cancellation checks, natural video playback, and sequential task processing.
+Keep synchronous Playwright objects on their owning worker thread. Update Qt widgets only on the main thread, polling worker queues with a Qt timer. Preserve cancellation checks, natural video playback, and sequential task processing.
 
 ## Testing Guidelines
 

@@ -96,6 +96,84 @@ class NextPageGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(BrowserError, '章节没有变化'):
                 self.session.next_chapter()
 
+    def test_detached_frame_during_poll_is_retried_instead_of_stopping(self):
+        calls = {"count": 0}
+
+        def chapter_kind():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return "document"
+            if calls["count"] == 2:
+                raise RuntimeError("Locator.count: Frame was detached")
+            return "quiz"
+
+        self.session.chapter_kind.side_effect = chapter_kind
+        with patch.object(self.session, "_view_signature",
+                          side_effect=lambda kind: ("old", True) if kind == "document"
+                          else ("questions", True)):
+            self.assertTrue(self.session.next_chapter())
+        self.assertGreaterEqual(calls["count"], 3)
+
+    def test_next_button_uses_the_fast_click_path(self):
+        with patch.object(self.session, '_view_signature', return_value=('old', True)):
+            with self.assertRaisesRegex(BrowserError, '章节没有变化'):
+                self.session.next_chapter()
+        self.session._click.assert_called_once_with(self.button, humanized=False)
+
+    def test_repeated_detachments_recover_within_transition_deadline(self):
+        probes = []
+
+        def snapshot(_kind):
+            if not probes:
+                probes.append("initial")
+                return "old", True
+            probes.append(self.clock)
+            if self.clock < 1.2:
+                raise RuntimeError("Frame was detached")
+            return "new", True
+
+        with patch.object(self.session, "_view_signature", side_effect=snapshot):
+            self.assertTrue(self.session.next_chapter())
+        self.assertGreater(len(probes), 8)
+        self.assertGreaterEqual(self.clock, 1.7)
+        self.assertLess(self.clock, self.session.NEXT_PAGE_TIMEOUT)
+
+    def test_persistent_detachments_use_deadline_and_keep_single_next_click(self):
+        probes = {"count": 0}
+
+        def snapshot(_kind):
+            probes["count"] += 1
+            if probes["count"] == 1:
+                return "old", True
+            raise RuntimeError("Frame was detached")
+
+        with patch.object(self.session, "_view_signature", side_effect=snapshot):
+            with self.assertRaisesRegex(BrowserError, "章节没有变化"):
+                self.session.next_chapter()
+        self.assertGreaterEqual(self.clock, self.session.NEXT_PAGE_TIMEOUT)
+        self.assertLess(self.clock, self.session.NEXT_PAGE_TIMEOUT + 0.11)
+        self.session._click.assert_called_once_with(self.button, humanized=False)
+
+    def test_warning_frame_retries_beyond_eight_failures_then_confirms_once(self):
+        warning = Mock()
+        warning_reads = {"count": 0}
+
+        def warning_class(_name):
+            warning_reads["count"] += 1
+            if warning_reads["count"] <= 12:
+                raise RuntimeError("Frame was detached")
+            return ""
+
+        warning.get_attribute.side_effect = warning_class
+        self.session._next_warning.side_effect = lambda: (
+            warning if 0.1 <= self.clock < 1.5 else None)
+        with patch.object(self.session, "_view_signature", side_effect=lambda _kind:
+                          ("old", True) if self.clock < 1.5 else ("new", True)):
+            self.assertTrue(self.session.next_chapter())
+        self.assertEqual(warning_reads["count"], 13)
+        self.assertEqual(self.session._click.call_count, 2)
+        self.session._click.assert_any_call(warning, humanized=False)
+
     def test_explicit_completion_destination_ends_normally(self):
         self.session.poll_ready.return_value = False
         self.session.chapter_kind.side_effect = lambda: 'document' if self.clock == 0 else 'unknown'

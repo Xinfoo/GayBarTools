@@ -42,8 +42,27 @@ class Workflow:
 
     def _content_task_state(self, kind: str, index: int, total: int) -> None:
         self.check_stop()
-        action = "视频正常播放中（自动处理插入题）" if kind == "video" else "阅读静态页面"
+        action = {"video": "视频正常播放中（自动处理插入题）", "document": "阅读静态页面",
+                  "quiz": "处理章节测验"}[kind]
         self.state(f"任务点 {index}/{total}：{action}")
+
+    def _solve_chapter_quiz(self) -> None:
+        self.check_stop()
+        if self.browser.quiz_completed():
+            self.log("已识别当前检测的提交结果，继续后续任务。")
+            return
+        questions = self.browser.get_questions()
+        if not questions:
+            raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
+        self.state(f"识别并解答 {len(questions)} 道题")
+        screenshot = self.browser.quiz_screenshot() if self.settings.vision or self.settings.ocr else None
+        answers = self.solver.solve(questions, screenshot)
+        self.check_stop()
+        self.browser.apply_answers(answers)
+        self.state("提交当前答题区域")
+        self.check_stop()
+        if not self.browser.submit_quiz():
+            raise WorkflowError("尚未确认提交成功，已停止，不会切换到下一节。")
 
     def run(self) -> int:
         visited: set[str] = set()
@@ -54,36 +73,21 @@ class Workflow:
             # the chapter already selected by next_chapter, rather than switch
             # to an unrelated tab opened while the task was running.
             kind = self.browser.chapter_kind() if visited else self.browser.prepare_start()
-            if kind not in {"video", "document", "quiz"}:
+            if kind not in {"video", "document", "quiz", "mixed"}:
                 raise WorkflowError("当前页面未识别到视频、文档或学习检测，请进入课程章节后重试；可查看诊断截图。")
             key = self.browser.chapter_key()
             if not key or key in visited:
                 raise WorkflowError("学习页面没有变化或发生循环，已停止。")
             visited.add(key)
             self.state(f"正在处理第 {completed + 1} 个学习页面")
-            if kind in {"video", "document"}:
-                self.browser.process_content(on_quiz=self._solve_video_quiz,
-                                             on_task=self._content_task_state)
+            if kind in {"video", "document", "mixed"}:
+                callbacks = {"on_quiz": self._solve_video_quiz, "on_task": self._content_task_state}
+                if kind == "mixed":
+                    callbacks["on_chapter_quiz"] = self._solve_chapter_quiz
+                self.browser.process_content(**callbacks)
+                self.check_stop()
             elif kind == "quiz":
-                if self.browser.quiz_completed():
-                    self.log("已识别当前检测的提交结果，继续下一节。")
-                else:
-                    questions = self.browser.get_questions()
-                    if not questions:
-                        raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
-                    self.state(f"识别并解答 {len(questions)} 道题")
-                    screenshot = self.browser.quiz_screenshot() if self.settings.vision or self.settings.ocr else None
-                    answers = self.solver.solve(questions, screenshot)
-                    self.check_stop()
-                    self.browser.apply_answers(answers)
-                    if not self.settings.auto_submit:
-                        self.log("答案已填写；自动提交已关闭，请手动检查并提交。")
-                        self.state("等待手动提交")
-                        return completed
-                    self.state("提交当前答题页")
-                    self.check_stop()
-                    if not self.browser.submit_quiz():
-                        raise WorkflowError("尚未确认提交成功，已停止，不会切换到下一节。")
+                self._solve_chapter_quiz()
             self.check_stop()
             completed += 1
             self.log(f"第 {completed} 个学习页面已处理完成，准备点击下一节。")

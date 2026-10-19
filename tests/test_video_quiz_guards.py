@@ -32,6 +32,9 @@ class VideoQuizGuardTests(unittest.TestCase):
         )
         self.browser._guard = Mock(side_effect=self.browser._check_stop)
         self.browser._video_visible = Mock(return_value=True)
+        # These media stubs have no DOM attachment card. Real task markers are
+        # exercised by the browser integration fixtures.
+        self.browser._task_marker_state = Mock(return_value=None)
 
     def test_callback_failure_preserves_error_restores_cache_and_pauses(self):
         old_questions, old_controls = {"old": question("old")}, {"old": {"A": Mock()}}

@@ -16,6 +16,7 @@ class Question:
     text: str
     kind: str
     options: tuple[Option, ...]
+    blank_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class Answer:
     question_id: str
     choices: tuple[str, ...]
     reason: str = ""
+    texts: tuple[str, ...] = ()
 
 
 class VideoQuizSolver(Protocol):

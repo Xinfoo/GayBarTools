@@ -99,13 +99,6 @@ class WorkflowTests(unittest.TestCase):
         self.browser.apply_answers.assert_not_called()
         self.browser.submit_quiz.assert_not_called()
 
-    def test_manual_mode_fills_but_does_not_submit(self):
-        self.settings.auto_submit = False
-        self.assertEqual(self.workflow().run(), 0)
-        self.browser.apply_answers.assert_called_once()
-        self.browser.submit_quiz.assert_not_called()
-        self.browser.next_chapter.assert_not_called()
-
     def test_stop_during_model_request_prevents_clicks(self):
         def solve(*args):
             self.stop.set()
