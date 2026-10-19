@@ -32,7 +32,7 @@ def doctor(paths):
     print(f"Python: {sys.version.split()[0]}")
     print(f"项目目录: {paths.root}")
     print(f"运行数据: {paths.runtime}")
-    for module in ("tkinter", "playwright"):
+    for module in ("PySide6", "playwright"):
         present = importlib.util.find_spec(module) is not None
         print(f"{module}: {'可用' if present else '未安装'}")
         healthy &= present
@@ -108,12 +108,12 @@ def main(argv=None):
                     return 0
                 finally:
                     browser.close()
-        import tkinter as tk
+        from PySide6.QtWidgets import QApplication
         from .ui import Application
-        root = tk.Tk()
-        Application(root, paths, settings, url)
-        root.mainloop()
-        return 0
+        app = QApplication(sys.argv[:1])
+        window = Application(paths, settings, url)
+        window.show()
+        return app.exec()
     except Exception as exc:
         message = str(exc)
         if settings.api_key:

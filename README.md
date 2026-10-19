@@ -6,7 +6,7 @@
 
 ## 安装与启动
 
-需要 Python 3.11+，桌面界面使用 Python 的 Tkinter。Linux 的 Python 发行包需包含 Tk，并需已有可用的 `bubblewrap`（`bwrap`）来限制浏览器写入；Windows 官方 Python 安装可包含 Tcl/Tk。程序不会安装系统包，也不会修改 shell 或用户浏览器设置。
+需要 Python 3.11+，桌面界面使用 PySide6 / Qt，由下方安装脚本安装到 `.venv`。Linux 需已有可用的 `bubblewrap`（`bwrap`）来限制浏览器写入，并具备桌面图形环境所需的系统库。程序不会安装系统包，也不会修改 shell 或用户浏览器设置。
 
 在项目目录执行：
 
@@ -76,6 +76,8 @@ OCR 为可选项：需已有 `tesseract` 和 `chi_sim`、`eng` 语言数据。�
 测试使用本地 HTTP 服务及独立临时配置；浏览器集成测试需要可运行的 Chromium，不会登录真实站点或调用付费 API。
 
 ## 数据与目录
+
+`gaybar_tools/assets/background.png` 用作整个软件窗口的背景，随窗口等比例缩放并居中裁切。图片也随安装包分发，安装后从其他目录启动仍可显示。
 
 持久运行数据位于项目的 `.runtime/`，已加入 `.gitignore`；Linux 浏览器 socket 使用短 `/tmp/gbt-*` 临时目录，关闭会话后清理，避免较长项目路径触发系统 socket 长度限制：
 

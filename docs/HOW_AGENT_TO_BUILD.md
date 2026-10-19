@@ -3,7 +3,7 @@
 项目名称：GayBarTools
 这是一个使用独立浏览器会话的学习通章节助手，实现视频播放、静态文档阅读、视频插题和章节测验的自动化处理。
 
-本文按 2026-10-18 的当前实现更新；安装启动见 [README](../README.md)，页面差异和验证范围见 [VIDEO_NOTES.md](VIDEO_NOTES.md)。
+本文按 2026-10-19 的当前实现更新；安装启动见 [README](../README.md)，页面差异和验证范围见 [VIDEO_NOTES.md](VIDEO_NOTES.md)。
 
 ## 参考
 
@@ -16,13 +16,14 @@
 
 ## 软件特征要求
 
-1. 使用 Python 3.11+、Tkinter 和 Playwright 编写。
+1. 使用 Python 3.11+、PySide6 / Qt 和 Playwright 编写；PySide6 随项目依赖安装。
 2. Linux 使用 Chromium 或 Edge，Windows 使用 Chromium、Chrome 或 Edge；支持自动查找或手动指定浏览器路径。
 3. 接入 OpenAI 兼容格式的 LLM API，支持按配置发送截图或本机 OCR 识别文本；OCR 为可选项。
 4. 使用模拟鼠标移动、点击和滚轮，带有随机落点与操作间隔。具体措施见 [ANTI_DETECTION.md](ANTI_DETECTION.md)，不保证规避平台检测。
 5. 使用独立浏览器配置，登录 Cookie 自动保存到项目的 `.runtime/`，也可点击“立即保存登录状态”；下次启动恢复登录状态，失效后由用户重新登录。
 6. “开始刷课”在空闲时可点击，点击后检查当前页面；执行任务和关闭窗口期间禁用。
 7. 桌面窗口默认至少为 1200×1100，并按界面实际所需空间调整，使日志栏默认可见；较小屏幕按屏幕尺寸收缩，为窗口边框和任务栏留出余量。
+8. `gaybar_tools/assets/background.png` 作为整个窗口的背景，随窗口等比例缩放并居中裁切，文字及布局区域透出背景。输入框、按钮和日志保持清晰可读；图片随安装包分发。
 
 ## 软件工作流程
 
@@ -79,7 +80,7 @@ python3 scripts/bootstrap.py
 .venv/bin/python -B -m unittest discover -s tests -v
 ```
 
-Windows 使用 `py scripts\bootstrap.py`、`run.bat` 和 `.venv\Scripts\python.exe`。Linux 需已有 Tkinter、可用的 bubblewrap 和浏览器所需系统库；OCR 另需已有 Tesseract 及相应语言数据，具体安装说明见 [README](../README.md)。
+Windows 使用 `py scripts\bootstrap.py`、`run.bat` 和 `.venv\Scripts\python.exe`。PySide6 / Qt 由安装脚本安装；Linux 需已有可用的 bubblewrap、桌面图形环境和浏览器所需系统库。OCR 另需已有 Tesseract 及相应语言数据，具体安装说明见 [README](../README.md)。
 
 ## 备注
 

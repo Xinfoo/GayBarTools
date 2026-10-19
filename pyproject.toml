@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "学习通章节学习桌面助手"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["playwright>=1.56,<2"]
+dependencies = ["playwright>=1.56,<2", "PySide6-Essentials>=6.12,<7"]
 
 [project.scripts]
 gaybar-tools = "gaybar_tools.__main__:main"
@@ -17,4 +17,4 @@ gaybar-tools = "gaybar_tools.__main__:main"
 include = ["gaybar_tools*"]
 
 [tool.setuptools.package-data]
-gaybar_tools = ["demo/*.html", "demo/*.webm", "demo/*.css", "demo/*.js"]
+gaybar_tools = ["demo/*.html", "demo/*.webm", "demo/*.css", "demo/*.js", "assets/*.png"]
