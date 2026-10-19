@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QCheckBox
+from PySide6.QtWidgets import (QApplication, QCheckBox, QLineEdit, QScrollArea,
+                               QStyle, QStyleOptionFrame)
 
 from gaybar_tools.config import AppSettings
 from gaybar_tools.paths import AppPaths
@@ -57,6 +58,29 @@ class ApplicationTests(unittest.TestCase):
     def test_start_is_enabled_before_a_chapter_is_detected(self):
         self.app.update_buttons()
         self.assertTrue(self.app.start_button.isEnabled())
+
+    def test_short_windows_preserve_line_edit_text_and_content_access(self):
+        self.app.show()
+        for height in (900, 800, 720):
+            with self.subTest(height=height):
+                self.app.resize(1200, height)
+                self.qt.processEvents()
+                for name, field in self.app.fields.items():
+                    if not isinstance(field, QLineEdit):
+                        continue
+                    option = QStyleOptionFrame()
+                    field.initStyleOption(option)
+                    text_rect = field.style().subElementRect(
+                        QStyle.SubElement.SE_LineEditContents, option, field,
+                    )
+                    self.assertGreaterEqual(text_rect.height(), field.fontMetrics().height(), name)
+                    self.assertTrue(field.parentWidget().rect().contains(field.geometry()), name)
+                scroll = self.app.findChild(QScrollArea)
+                scroll.ensureWidgetVisible(self.app.logs)
+                origin = self.app.logs.mapTo(scroll.viewport(), self.app.logs.rect().topLeft())
+                log_rect = self.app.logs.rect().translated(origin)
+                self.assertTrue(scroll.viewport().rect().intersects(log_rect))
+                scroll.verticalScrollBar().setValue(0)
 
     def test_readiness_loss_does_not_disable_start(self):
         for ready in (True, False):

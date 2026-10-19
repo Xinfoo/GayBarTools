@@ -8,7 +8,8 @@ from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QFileDialog, QGridLayout, QGroupBox,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QPlainTextEdit, QPushButton, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QPushButton, QScrollArea,
+                               QSizePolicy, QVBoxLayout, QWidget)
 
 from .config import AppSettings
 from .paths import AppPaths
@@ -29,11 +30,11 @@ class Application(QWidget):
         self.background = QPixmap(str(Path(__file__).with_name("assets") / "background.png"))
         self.setWindowTitle("GayBarTools · 学习通章节助手" + (" · 本地演示" if demo_url else ""))
         self.build()
-        available, needed = self.screen().availableGeometry(), self.sizeHint()
-        width = min(max(1200, needed.width()), max(1, available.width() - 80))
-        height = min(max(1100, needed.height()), max(1, available.height() - 60))
-        self.resize(width, height)
-        self.setMinimumSize(min(820, width), min(720, height))
+        available = self.screen().availableGeometry()
+        side = min(900, available.width() - 80, available.height() - 100)
+        side = max(100, side // 100 * 100)
+        self.resize(side, side)
+        self.setMinimumSize(min(820, side), min(720, side))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain)
         self.timer.start(100)
@@ -69,8 +70,16 @@ class Application(QWidget):
             QPushButton#start:disabled { background: #74859b; color: #d5d9df; }
             QPlainTextEdit { background: #10233d; color: #d9e6f4; padding: 10px;
                              border: 1px solid #b6adbf; font-family: monospace; }
+            QScrollArea { background: transparent; border: none; }
         """)
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.viewport().setAutoFillBackground(False)
+        content = QWidget()
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
         title = QLabel("GayBarTools", objectName="title")
@@ -139,11 +148,15 @@ class Application(QWidget):
         layout.addWidget(self.url)
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
-        self.logs.setMinimumHeight(self.logs.fontMetrics().lineSpacing() * 9 + 24)
+        self.logs.setMinimumHeight(self.logs.fontMetrics().lineSpacing() * 4 + 24)
+        # Fill spare space without forcing the scroll page to the log's size hint.
+        self.logs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout.addWidget(self.logs, 1)
         footer = QLabel("遇到未识别页面、答案格式重试耗尽或提交异常会停止，并保存诊断截图。")
         footer.setWordWrap(True)
         layout.addWidget(footer)
+        scroll.setWidget(content)
+        content.setAutoFillBackground(False)
         self.update_buttons()
 
     def entry(self, layout, row, label, name):
