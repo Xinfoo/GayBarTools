@@ -102,10 +102,9 @@ _QUESTION_SELECTORS_JS = ("'[data-question-id], .TiMu, .questionLi, .question-it
                           ".question, fieldset, .examPaper_question, .singleQuesId'")
 _TITLE_SELECTORS_JS = ("'.Zy_TItle, .question-title, .questionTitle, .stem, legend, "
                        ".mark_name, .qtContent'")
-_OPTION_SELECTORS_JS = ("'.Zy_ulTop > li, .answerList > li, .answer-list > li, "
-                        ".options > li, .option, [role=radio], [role=checkbox], label'")
+_OPTION_SELECTORS_JS = json.dumps(_OPTION_SELECTORS)
 _TEXT_SELECTORS_JS = ("'textarea, input:not([type]), input[type=text], "
-                      "[contenteditable=true], .blankItemInp, iframe'")
+                      "[contenteditable=true], [contenteditable=plaintext-only], .blankItemInp, iframe'")
 _NAV_SELECTOR_JS = ("'nav, aside, [role=navigation], .catalog, .course-outline, "
                     ".chapter-list, .sidebar, .directory, .toc, .outline'")
 _PLAYER_SELECTOR_JS = ("'.video-js, .video-stage, .ans-video, .ans-video-player, "
@@ -117,7 +116,7 @@ _QUIZ_PROBE_SCRIPT = r"""(root) => {
     if (/\/modules\/video\//i.test(location.pathname)) return {rows: [], ready: false};
     const questionSelector = %s;
     const titleSelector = %s;
-    const optionSelector = %s;
+    const optionSelectors = %s;
     const textSelector = %s;
     const navSelector = %s;
     const playerSelector = %s;
@@ -133,6 +132,64 @@ _QUIZ_PROBE_SCRIPT = r"""(root) => {
         return true;
     };
     const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+    const nativeChoice = 'input[type=radio], input[type=checkbox]';
+    const choiceControls = block => {
+        // Match the full extractor's selector priority. A union double-counts
+        // labels nested in custom option rows and misses plain input wrappers.
+        for (const selector of optionSelectors) {
+            const controls = [...block.querySelectorAll(selector)].slice(0, 30).filter(visible);
+            if (controls.length >= 2) return controls;
+        }
+        const wrappers = [...block.querySelectorAll('label, li, div, p')].filter(e =>
+            e.querySelectorAll(nativeChoice).length === 1 && clean(e.innerText));
+        const controls = wrappers.filter(e => !wrappers.some(other =>
+            other !== e && e.contains(other))).slice(0, 30).filter(visible);
+        return controls.length >= 2 ? controls
+            : [...block.querySelectorAll(nativeChoice)].slice(0, 30).filter(visible);
+    };
+    const excluded = '[role=toolbar], .edui-toolbar, .edui-dialog-container, '
+        + '.edui-popup, .tox-toolbar, .tox-dialog, .cke_top, .cke_bottom';
+    const textControls = (scope, depth = 0) => {
+        let count = 0, uncertain = false;
+        for (const control of [...scope.querySelectorAll(textSelector)].slice(0, 100)) {
+            if (!visible(control) || control.closest(excluded)) continue;
+            if (control.matches('.blankItemInp')) {
+                // The preview activates this blank's initially hidden editor.
+                // Keep the stable blank as one field, not its backing textarea.
+                if (control.querySelector('.InpDIV') && control.querySelector('.textDIV')) count++;
+                continue;
+            }
+            if (control.closest('.blankItemInp')) continue;
+            if (control.tagName === 'IFRAME') {
+                if (depth >= 4) continue;
+                try {
+                    const doc = control.contentDocument;
+                    if (!doc) { uncertain = true; continue; }
+                    const nested = textControls(doc, depth + 1);
+                    count += nested.count;
+                    uncertain = uncertain || nested.uncertain;
+                } catch (_) { uncertain = true; }
+                continue;
+            }
+            if (control.matches(':disabled') || control.readOnly
+                || control.getAttribute('aria-disabled') === 'true'
+                || control.getAttribute('aria-readonly') === 'true'
+                || control.parentElement?.closest(
+                    '[contenteditable=true], [contenteditable=plaintext-only]')) continue;
+            count++;
+        }
+        return {count, uncertain};
+    };
+    const relativePath = element => {
+        const base = root.nodeType === 9 ? root.documentElement : root;
+        const path = [];
+        for (let e = element; e !== base; e = e.parentElement) {
+            if (!e || !e.parentElement) return null;
+            path.unshift(':nth-child(' + ([...e.parentElement.children].indexOf(e) + 1) + ')');
+        }
+        return (root.nodeType === 9 ? 'html' : ':scope')
+            + (path.length ? ' > ' + path.join(' > ') : '');
+    };
     let found = [];
     for (const selector of questionSelector.split(',').map(s => s.trim())) {
         const candidates = [...root.querySelectorAll(selector)].slice(0, 300).filter(e =>
@@ -152,13 +209,13 @@ _QUIZ_PROBE_SCRIPT = r"""(root) => {
         // Unknown wrappers (plain article/panel with standard labels) are
         // recognised by question text and grouped controls, matching the full
         // extractor's fallback without one Playwright round trip per element.
-        const nativeChoice = 'input[type=radio], input[type=checkbox], [role=radio], [role=checkbox]';
+        const nativeControls = nativeChoice + ', [role=radio], [role=checkbox]';
         const containers = [...root.querySelectorAll('div, section, article, fieldset, li')]
             .slice(0, 600).filter(e => visible(e) && !e.closest(navSelector)
                 && !e.closest(playerSelector) && !e.querySelector(playerSelector));
         const matches = containers.map(e => {
             const body = (e.innerText || '').trim();
-            if (e.querySelectorAll(nativeChoice).length < 2
+            if (e.querySelectorAll(nativeControls).length < 2
                 && !(/(?:填空|简答)题/.test(body) && e.querySelector(textSelector))) return null;
             const title = e.querySelector(titleSelector + ', h2, h3, h4');
             if (!/(?:单选|多选|判断|填空|简答)题/.test(body)
@@ -169,24 +226,29 @@ _QUIZ_PROBE_SCRIPT = r"""(root) => {
     }
     if (!found.length) return {rows: [], ready: false};
     const blocks = found.filter(e => !found.some(other => other !== e && e.contains(other)));
-    const rows = blocks.map(block => {
+    const pendingText = [];
+    const rows = blocks.map((block, index) => {
         const title = block.querySelector(titleSelector);
         const bodyText = block.innerText || '';
         const stem = clean(title ? title.innerText : (bodyText.split('\n')[0] || bodyText));
         const id = block.getAttribute('data-question-id') || block.getAttribute('data-id')
             || block.getAttribute('id') || '';
-        const textQuestion = /填空题|简答题/.test(stem);
-        const choices = textQuestion ? [] : [...block.querySelectorAll(optionSelector)]
-            .filter(e => visible(e) && !e.closest(playerSelector));
-        const fields = textQuestion ? [...block.querySelectorAll(textSelector)] : [];
+        const textKind = stem.match(/(?:\[|【)\s*(填空|简答)题\s*(?:\]|】)|^(?:\d+[.、．:：)）]?\s*)?(填空|简答)题(?:\s|[:：])/);
+        const textQuestion = !!textKind;
+        const shortAnswer = textQuestion && textKind[0].includes('简答');
+        const choices = textQuestion ? [] : choiceControls(block);
+        const fields = textQuestion ? textControls(block) : {count: 0, uncertain: false};
+        if (fields.uncertain) pendingText.push({index, path: relativePath(block), short: shortAnswer});
         const labels = choices.map(e => clean(e.innerText || e.getAttribute('aria-label')
             || e.getAttribute('value') || '')).filter(Boolean);
-        const count = textQuestion ? fields.length : choices.length;
-        const ready = !!stem && (textQuestion ? count > 0 : count >= 2);
+        const count = textQuestion ? fields.count : choices.length;
+        const ready = !!stem && (textQuestion
+            ? !fields.uncertain && (shortAnswer ? count === 1 : count > 0)
+            : count >= 2 && labels.length === count);
         return [id, stem.slice(0, 200), textQuestion ? 'text' : 'choice', count,
                 labels.slice(0, 12), ready ? 1 : 0];
     });
-    return {rows, ready: rows.length > 0 && rows.every(row => row[5] === 1)};
+    return {rows, ready: rows.length > 0 && rows.every(row => row[5] === 1), pendingText};
 }""" % (_QUESTION_SELECTORS_JS, _TITLE_SELECTORS_JS, _OPTION_SELECTORS_JS,
         _TEXT_SELECTORS_JS, _NAV_SELECTOR_JS, _PLAYER_SELECTOR_JS)
 
@@ -743,7 +805,7 @@ class BrowserSession:
         Walking every frame's ancestor chain is one of the most frequently
         repeated calls during a transition. Frames cannot meaningfully change
         visibility within a single 0.25 s poll; the cache is reset before the
-        next poll and after every click.
+        next poll and when navigation ends.
         """
         if self._navigation_mode:
             key = id(frame)
@@ -802,6 +864,33 @@ class BrowserSession:
         if not isinstance(raw, dict):
             raw = {"rows": [], "ready": False}
         rows = raw.get("rows") if isinstance(raw.get("rows"), list) else []
+        pending = raw.get("pendingText")
+        if isinstance(pending, list) and pending:
+            # DOM JS cannot read cross-origin editor frames. Resolve only those
+            # exact question blocks through Playwright; ordinary polls remain
+            # one compact evaluate, without a full per-question extraction.
+            for item in pending:
+                if not isinstance(item, dict):
+                    continue
+                index, path = item.get("index"), item.get("path")
+                if (not isinstance(index, int) or index < 0 or index >= len(rows)
+                        or not isinstance(path, str) or not path
+                        or not isinstance(rows[index], list) or len(rows[index]) < 6):
+                    continue
+                self._check_stop()
+                try:
+                    block = root if path == ":scope" else root.locator(path)
+                    fields = self._text_answer_controls(block)
+                    count = len(fields)
+                    rows[index][3] = count
+                    rows[index][5] = int(bool(rows[index][1]) and (
+                        count == 1 if item.get("short") else count > 0))
+                except StopRequested:
+                    raise
+                except Exception:
+                    rows[index][5] = 0
+            raw["ready"] = bool(rows) and all(
+                isinstance(row, list) and len(row) >= 6 and row[5] == 1 for row in rows)
         ready = bool(raw.get("ready")) and bool(rows)
         payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         result = {
@@ -1705,20 +1794,30 @@ class BrowserSession:
         roots = [target]
         handle = target.element_handle(timeout=1500)
         if handle is None:
-            raise BrowserError("章节测验区域已发生变化。")
+            # Locators re-resolve the same assessment after a DOM replacement.
+            # An empty transition must not widen the scope to sibling quizzes.
+            return []
         try:
             owner = handle.owner_frame()
+            if owner is None:
+                return []
             for frame in self._frames():
-                ancestor = frame
-                while ancestor.parent_frame is not None and ancestor.parent_frame is not owner:
-                    ancestor = ancestor.parent_frame
-                if ancestor.parent_frame is owner:
-                    element = ancestor.frame_element()
-                    try:
-                        if handle.evaluate("(root,child) => root===child || root.contains(child)", element):
-                            roots.append(frame)
-                    finally:
-                        element.dispose()
+                try:
+                    ancestor = frame
+                    while ancestor.parent_frame is not None and ancestor.parent_frame is not owner:
+                        ancestor = ancestor.parent_frame
+                    if ancestor.parent_frame is owner:
+                        element = ancestor.frame_element()
+                        try:
+                            if handle.evaluate("(root,child) => root===child || root.contains(child)", element):
+                                roots.append(frame)
+                        finally:
+                            element.dispose()
+                except BrowserError:
+                    raise
+                except Exception:
+                    # A detaching sibling cannot invalidate the current quiz.
+                    continue
         finally:
             handle.dispose()
         return roots
@@ -3482,7 +3581,11 @@ class BrowserSession:
         except BrowserError:
             raise
         except Exception:
-            roots = self._frames()
+            # The next poll can re-resolve the current locator. Never use a
+            # different assessment's grade when this scope is transitioning.
+            return False
+        if not roots:
+            return False
         result = any(self._result_probe_cached(frame) for frame in roots)
         if self._navigation_mode:
             self._nav_result_visible[id(self._quiz_target)] = result
@@ -3561,7 +3664,13 @@ class BrowserSession:
         if self._quiz_target is None:
             return self._frames()
         roots = []
-        frame = self._video_frame(self._quiz_target)
+        handle = self._quiz_target.element_handle(timeout=1500)
+        if handle is None:
+            return []
+        try:
+            frame = handle.owner_frame()
+        finally:
+            handle.dispose()
         while frame is not None:
             roots.append(frame)
             frame = frame.parent_frame
@@ -3571,17 +3680,27 @@ class BrowserSession:
         self._guard()
         if self._result_visible():
             return True
+        deadline = time.monotonic() + 20
         submit = None
-        try:
-            roots = self._quiz_roots()
-        except BrowserError:
-            raise
-        except Exception:
-            roots = self._frames()
-        for root in roots:
-            submit = self._text_control(_SUBMIT, root=root)
+        while time.monotonic() < deadline:
+            try:
+                roots = self._quiz_roots()
+            except BrowserError:
+                raise
+            except Exception:
+                roots = []
+            for root in roots:
+                submit = self._text_control(_SUBMIT, root=root)
+                if submit is not None:
+                    break
             if submit is not None:
                 break
+            # The current frame may be replacing its document or already
+            # showing the result. Retry only its own scope, without clicking.
+            if self._result_visible():
+                return True
+            self._wait(0.3)
+            self._guard()
         if submit is None:
             raise BrowserError("未找到可识别的提交按钮。")
         self._submitting = True
@@ -3745,7 +3864,6 @@ class BrowserSession:
         deadline = time.monotonic() + self.NEXT_PAGE_TIMEOUT
         candidate, candidate_since = None, 0.0
         departed_since = 0.0
-        transient_errors = 0
         kind, content_ready = previous_kind, _previous_ready
         while time.monotonic() < deadline:
             # One discovery pass per poll; chapter_kind, the signature and the
@@ -3764,9 +3882,8 @@ class BrowserSession:
                     except BrowserError:
                         raise
                     except Exception:
-                        transient_errors += 1
-                        if transient_errors >= 8:
-                            raise
+                        # Frame replacement can take longer than a handful of
+                        # polls. Retry within the existing transition deadline.
                         self._wait(0.1)
                         continue
                     warning_confirmed = True
@@ -3788,12 +3905,9 @@ class BrowserSession:
                 # The fast click can replace the old frame while a probe is
                 # still resolving a locator. Treat that as a transient poll
                 # failure and retry on the new document.
-                transient_errors += 1
-                if transient_errors >= 8:
-                    raise
+                candidate, candidate_since, departed_since = None, 0.0, 0.0
                 self._wait(0.1)
                 continue
-            transient_errors = 0
             changed = kind != previous_kind or signature != previous
             if include_occluded and kind in {"video", "document", "mixed"} and previous_kind in {"video", "document", "mixed"}:
                 changed = signature != previous
