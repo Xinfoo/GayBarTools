@@ -19,6 +19,8 @@ class Application(QWidget):
     def __init__(self, paths: AppPaths, settings: AppSettings,
                  demo_url: str | None = None):
         super().__init__()
+        # Delete widgets while Qt is running, before Python/PySide exit cleanup.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.paths, self.settings, self.demo_url = paths, settings, demo_url
         self.events: queue.Queue = queue.Queue()
         self.worker = Worker(paths, self.events, demo_url)

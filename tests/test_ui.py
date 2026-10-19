@@ -1,7 +1,10 @@
 """Exercise desktop controls and worker events without a display or browser."""
 
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -170,6 +173,41 @@ class ApplicationTests(unittest.TestCase):
         event = QCloseEvent()
         self.app.closeEvent(event)
         self.assertTrue(event.isAccepted())
+
+
+class ProcessShutdownTests(unittest.TestCase):
+    def test_main_exits_without_crashing_during_pyside_cleanup(self):
+        # A long-lived QApplication in this test process hides teardown crashes.
+        script = textwrap.dedent("""
+            import tempfile
+            from pathlib import Path
+            from unittest.mock import patch
+            from PySide6.QtCore import QTimer
+            from gaybar_tools.__main__ import main
+            from gaybar_tools.config import AppSettings
+            from gaybar_tools.paths import AppPaths
+            from gaybar_tools.ui import Application
+
+            class ClosingWindow(Application):
+                def __init__(self, *args):
+                    super().__init__(*args)
+                    QTimer.singleShot(20, self.close)
+
+            with tempfile.TemporaryDirectory(prefix='gaybar-exit-test-') as folder:
+                paths = AppPaths.for_root(Path(folder)).prepare()
+                with patch('gaybar_tools.__main__.AppPaths.for_root', return_value=paths), \\
+                        patch('gaybar_tools.__main__.AppSettings.load', return_value=AppSettings()), \\
+                        patch('gaybar_tools.ui.Application', ClosingWindow):
+                    result = main([])
+                assert result == 0, result
+        """)
+        result = subprocess.run(
+            [sys.executable, "-B", "-X", "faulthandler", "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
