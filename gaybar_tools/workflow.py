@@ -55,7 +55,7 @@ class Workflow:
         if not questions:
             raise WorkflowError("未识别到可作答题目，已停止，请检查是否已提交或页面尚未加载。")
         self.state(f"识别并解答 {len(questions)} 道题")
-        screenshot = self.browser.quiz_screenshot() if self.settings.vision or self.settings.ocr else None
+        screenshot = self.browser.quiz_screenshot()
         answers = self.solver.solve(questions, screenshot)
         self.check_stop()
         self.browser.apply_answers(answers)

@@ -37,7 +37,7 @@ class QuizSolverTests(unittest.TestCase):
         self.stop = threading.Event()
         self.solver = QuizSolver(self.settings, self.messages.append, self.stop)
 
-    def solve_with(self, answers, questions=None, screenshot=None):
+    def solve_with(self, answers, questions=None, screenshot=PNG):
         with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(json.dumps({"answers": answers}))) as mocked:
             result = self.solver.solve(questions or [make_question()], screenshot)
             return result, mocked
@@ -72,7 +72,7 @@ class QuizSolverTests(unittest.TestCase):
         self.assertEqual(result[2].texts, ("Complete response.\nSecond paragraph.",))
         self.assertEqual(result[2].choices, ())
         messages = json.loads(mocked.call_args.args[0].data)["messages"]
-        extracted = json.loads(messages[1]["content"].split("\n", 1)[1])
+        extracted = json.loads(messages[1]["content"][0]["text"].split("\n", 1)[1])
         self.assertNotIn("blank_count", extracted[0])
         self.assertEqual(extracted[1]["blank_count"], 2)
         self.assertEqual(extracted[2]["blank_count"], 1)
@@ -132,7 +132,7 @@ class QuizSolverTests(unittest.TestCase):
         incomplete = json.dumps({"answers": [{"question_id": "fill", "texts": ["one"]}]})
         with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(incomplete)) as mocked:
             with self.assertRaisesRegex(AnswerFormatError, "重试 3 次"):
-                self.solver.solve([Question("fill", "Two blanks.", "fill", (), 2)])
+                self.solver.solve([Question("fill", "Two blanks.", "fill", (), 2)], PNG)
         self.assertEqual(mocked.call_count, 4)
 
     def test_invalid_text_question_metadata_is_rejected_before_network(self):
@@ -148,7 +148,7 @@ class QuizSolverTests(unittest.TestCase):
         with patch("gaybar_tools.llm.request.OpenerDirector.open") as mocked:
             for question in invalid:
                 with self.subTest(question=question), self.assertRaises(SolverError):
-                    self.solver.solve([question])
+                    self.solver.solve([question], PNG)
             mocked.assert_not_called()
 
     def test_request_fuses_dom_and_base64_screenshot_without_local_key(self):
@@ -204,8 +204,8 @@ class QuizSolverTests(unittest.TestCase):
     def test_video_quiz_feedback_is_bounded_without_exposing_it_in_logs(self):
         feedback = "错" * self.solver.MAX_VIDEO_QUIZ_FEEDBACK_CHARS + "EXCLUDED_PAGE_TAIL"
         with patch.object(self.solver, "_completion", return_value=json.dumps({"answers": [answer()]})) as completion:
-            self.solver.solve([make_question()], video_quiz_feedback=feedback)
-        prompt = completion.call_args.args[0][1]["content"]
+            self.solver.solve([make_question()], PNG, video_quiz_feedback=feedback)
+        prompt = completion.call_args.args[0][1]["content"][0]["text"]
         self.assertIn("错" * self.solver.MAX_VIDEO_QUIZ_FEEDBACK_CHARS, prompt)
         self.assertNotIn("EXCLUDED_PAGE_TAIL", prompt)
         self.assertNotIn("错", "\n".join(self.messages))
@@ -213,45 +213,11 @@ class QuizSolverTests(unittest.TestCase):
     def test_json_fence_and_content_array(self):
         content = [{"type": "text", "text": "```json\n"}, {"type": "text", "text": json.dumps({"answers": [answer()]}) + "\n```"}]
         with patch("gaybar_tools.llm.request.OpenerDirector.open", return_value=api_response(content)):
-            self.assertEqual(self.solver.solve([make_question()])[0].choices, ("A",))
+            self.assertEqual(self.solver.solve([make_question()], PNG)[0].choices, ("A",))
 
     def test_top_level_array_is_unambiguous(self):
         with patch("gaybar_tools.llm.request.OpenerDirector.open", return_value=api_response(json.dumps([answer()]))):
-            self.assertEqual(len(self.solver.solve([make_question()])), 1)
-
-    def test_ocr_only_does_not_send_image_but_keeps_dom(self):
-        self.settings.vision = False
-        self.settings.ocr = True
-        with patch.object(self.solver, "_ocr_screenshot", return_value="识别到的文字") as ocr:
-            _, mocked = self.solve_with([answer()], screenshot=PNG)
-        ocr.assert_called_once_with(PNG)
-        content = json.loads(mocked.call_args.args[0].data)["messages"][1]["content"]
-        self.assertIsInstance(content, str)
-        self.assertIn("识别到的文字", content)
-        self.assertIn("Which statements are true?", content)
-
-    def test_both_ocr_and_vision_are_fused(self):
-        self.settings.ocr = True
-        with patch.object(self.solver, "_ocr_screenshot", return_value="OCR evidence"):
-            _, mocked = self.solve_with([answer()], screenshot=PNG)
-        content = json.loads(mocked.call_args.args[0].data)["messages"][1]["content"]
-        self.assertIn("OCR evidence", content[0]["text"])
-        self.assertEqual(content[1]["type"], "image_url")
-
-    def test_video_quiz_correction_sends_wrong_screen_even_in_ocr_only_mode(self):
-        self.settings.vision = False
-        self.settings.ocr = True
-        with patch.object(self.solver, "_ocr_screenshot", return_value="当前界面：答错了") as ocr, patch(
-            "gaybar_tools.llm.request.OpenerDirector.open",
-            return_value=api_response(json.dumps({"answers": [answer(choices=["B"])]})),
-        ) as mocked:
-            result = self.solver.solve([make_question()], PNG, video_quiz_feedback="之前答案 q1: A，页面判错。")
-        ocr.assert_called_once_with(PNG)
-        content = json.loads(mocked.call_args.args[0].data)["messages"][1]["content"]
-        self.assertIn("当前界面：答错了", content[0]["text"])
-        self.assertIn("之前提交的答案已被视频插题判定为错误", content[0]["text"])
-        self.assertEqual(content[1]["image_url"]["url"], "data:image/png;base64," + base64.b64encode(PNG).decode())
-        self.assertEqual(result[0].choices, ("B",))
+            self.assertEqual(len(self.solver.solve([make_question()], PNG)), 1)
 
     def test_invalid_model_outputs_never_return_partial_answers(self):
         invalid = [
@@ -269,7 +235,7 @@ class QuizSolverTests(unittest.TestCase):
         for content, expected in invalid:
             with self.subTest(content=content), patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(content)) as mocked:
                 with self.assertRaisesRegex(SolverError, expected):
-                    self.solver.solve([make_question()])
+                    self.solver.solve([make_question()], PNG)
                 self.assertEqual(mocked.call_count, 4)
 
     def test_missing_question_rejected(self):
@@ -282,21 +248,19 @@ class QuizSolverTests(unittest.TestCase):
                 responses = [api_response("not json") for _ in range(failures)]
                 responses.append(api_response(json.dumps({"answers": [answer()]})))
                 with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses) as mocked:
-                    result = self.solver.solve([make_question()])
+                    result = self.solver.solve([make_question()], PNG)
                 self.assertEqual(result[0].choices, ("A",))
                 self.assertEqual(mocked.call_count, failures + 1)
 
-    def test_retry_preserves_all_question_evidence_without_repeating_ocr_or_raw_output(self):
-        self.settings.ocr = True
+    def test_retry_preserves_all_question_evidence_without_echoing_raw_output(self):
         questions = [make_question(), make_question("q2", "multiple")]
         private_output = "PRIVATE_RAW_MODEL_OUTPUT_INVALID_JSON"
         responses = [api_response(private_output), api_response(json.dumps({"answers": [answer(), answer("q2", ["A", "B"])]}))]
-        with patch.object(self.solver, "_ocr_screenshot", return_value="OCR evidence") as ocr, patch(
+        with patch(
             "gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses
         ) as mocked:
             result = self.solver.solve(questions, PNG)
         self.assertEqual(len(result), 2)
-        ocr.assert_called_once_with(PNG)
         self.assertEqual(mocked.call_count, 2)
         payloads = [json.loads(call.args[0].data) for call in mocked.call_args_list]
         first_source = payloads[0]["messages"][1]
@@ -320,7 +284,6 @@ class QuizSolverTests(unittest.TestCase):
             self.assertNotIn(private_output, json.dumps(payload, ensure_ascii=False))
         self.assertIn("q1", source_text)
         self.assertIn("q2", source_text)
-        self.assertIn("OCR evidence", source_text)
         feedback = request_texts[1].replace(payloads[0]["messages"][0]["content"], "").replace(source_text, "")
         self.assertIn("JSON", feedback)
         self.assertNotIn(private_output, "\n".join(self.messages))
@@ -329,23 +292,21 @@ class QuizSolverTests(unittest.TestCase):
         incomplete = json.dumps({"answers": [answer()]})
         with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response(incomplete)) as mocked:
             with self.assertRaisesRegex(SolverError, "遗漏"):
-                self.solver.solve([make_question(), make_question("q2")])
+                self.solver.solve([make_question(), make_question("q2")], PNG)
         self.assertEqual(mocked.call_count, 4)
 
     def test_format_retry_preserves_video_quiz_correction_evidence(self):
-        self.settings.ocr = True
         feedback = "上一轮答案 q1: A；页面显示答错。"
         responses = [api_response("not json"), api_response(json.dumps({"answers": [answer(choices=["B"])]}))]
-        with patch.object(self.solver, "_ocr_screenshot", return_value="当前答错界面文字") as ocr, patch(
+        with patch(
             "gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses
         ) as mocked:
             result = self.solver.solve([make_question()], PNG, video_quiz_feedback=feedback)
-        ocr.assert_called_once_with(PNG)
         payloads = [json.loads(call.args[0].data) for call in mocked.call_args_list]
         original_evidence = payloads[0]["messages"][1]
         self.assertEqual(payloads[1]["messages"][1], original_evidence)
         self.assertIn(json.dumps(feedback, ensure_ascii=False), original_evidence["content"][0]["text"])
-        self.assertIn("当前答错界面文字", original_evidence["content"][0]["text"])
+        self.assertEqual(original_evidence["content"][1]["type"], "image_url")
         self.assertEqual(len(payloads[1]["messages"]), 3)
         self.assertEqual(result[0].choices, ("B",))
 
@@ -354,7 +315,7 @@ class QuizSolverTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 responses = [invalid(), api_response(json.dumps({"answers": [answer()]}))]
                 with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=responses) as mocked:
-                    result = self.solver.solve([make_question()])
+                    result = self.solver.solve([make_question()], PNG)
                 self.assertEqual(result[0].choices, ("A",))
                 self.assertEqual(mocked.call_count, 2)
 
@@ -371,7 +332,7 @@ class QuizSolverTests(unittest.TestCase):
             "gaybar_tools.llm.request.OpenerDirector.open", side_effect=lambda *args, **kwargs: api_response("not json")
         ) as mocked:
             with self.assertRaises(SolverCancelled):
-                self.solver.solve([make_question()])
+                self.solver.solve([make_question()], PNG)
         mocked.assert_called_once()
 
     def test_transport_provider_and_refusal_errors_are_not_retried(self):
@@ -391,7 +352,7 @@ class QuizSolverTests(unittest.TestCase):
 
             with self.subTest(failure=failure), patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=response) as mocked:
                 with self.assertRaises(SolverError) as caught:
-                    self.solver.solve([make_question()])
+                    self.solver.solve([make_question()], PNG)
                 self.assertNotIsInstance(caught.exception, AnswerFormatError)
                 self.assertNotIn("private", str(caught.exception))
                 mocked.assert_called_once()
@@ -421,21 +382,15 @@ class QuizSolverTests(unittest.TestCase):
         with patch("gaybar_tools.llm.request.OpenerDirector.open") as mocked:
             for questions in invalid_questions:
                 with self.subTest(questions=questions), self.assertRaises(SolverError):
-                    self.solver.solve(questions)
+                    self.solver.solve(questions, PNG)
             mocked.assert_not_called()
 
     def test_empty_and_invalid_screenshot_rejected(self):
         with patch("gaybar_tools.llm.request.OpenerDirector.open") as mocked:
-            for screenshot in [b"", b"not-an-image", "not-bytes"]:
+            for screenshot in [None, b"", b"not-an-image", "not-bytes"]:
                 with self.subTest(screenshot=screenshot), self.assertRaises(SolverError):
                     self.solver.solve([make_question()], screenshot)
             mocked.assert_not_called()
-
-    def test_disabled_recognition_rejected(self):
-        self.settings.vision = False
-        self.settings.ocr = False
-        with self.assertRaisesRegex(SolverError, "至少启用"):
-            self.solver.solve([make_question()], PNG)
 
     def test_bad_settings_rejected_before_network(self):
         for field, value in [("model", ""), ("request_timeout", 0), ("api_key", "bad\nkey")]:
@@ -499,37 +454,6 @@ class QuizSolverTests(unittest.TestCase):
 
         with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=response), self.assertRaises(SolverCancelled):
             self.solver.test_connection()
-
-    def test_ocr_missing_binary(self):
-        with patch("gaybar_tools.llm.shutil.which", return_value=None), self.assertRaisesRegex(SolverError, "未找到 tesseract"):
-            self.solver._ocr_screenshot(PNG)
-
-    def test_ocr_uses_only_pipes_and_reports_no_stderr(self):
-        process = Mock()
-        process.communicate.return_value = ("截图文字".encode(), None)
-        process.returncode = 0
-        process.poll.return_value = 0
-        with patch("gaybar_tools.llm.shutil.which", return_value="/usr/bin/tesseract"), patch("gaybar_tools.llm.subprocess.Popen", return_value=process) as launch:
-            self.assertEqual(self.solver._ocr_screenshot(PNG), "截图文字")
-        self.assertEqual(launch.call_args.args[0], ["/usr/bin/tesseract", "stdin", "stdout", "-l", "chi_sim+eng"])
-        self.assertEqual(process.communicate.call_args.kwargs["input"], PNG)
-        process.returncode = 1
-        with patch("gaybar_tools.llm.shutil.which", return_value="tesseract"), patch("gaybar_tools.llm.subprocess.Popen", return_value=process):
-            with self.assertRaisesRegex(SolverError, "语言包"):
-                self.solver._ocr_screenshot(PNG)
-
-    def test_ocr_cancellation_kills_child(self):
-        process = Mock()
-        process.poll.return_value = None
-
-        def launch(*args, **kwargs):
-            self.stop.set()
-            return process
-
-        with patch("gaybar_tools.llm.shutil.which", return_value="tesseract"), patch("gaybar_tools.llm.subprocess.Popen", side_effect=launch):
-            with self.assertRaises(SolverCancelled):
-                self.solver._ocr_screenshot(PNG)
-        process.kill.assert_called_once()
 
 
 class EndpointTests(unittest.TestCase):

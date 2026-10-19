@@ -27,11 +27,12 @@ class VideoQuizGuardTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.stop = threading.Event()
         self.browser = BrowserSession(
-            AppSettings(vision=False, ocr=False, video_timeout=20, poll_interval=.05),
+            AppSettings(video_timeout=20, poll_interval=.05),
             AppPaths.for_root(Path(temporary.name)), lambda _message: None, self.stop,
         )
         self.browser._guard = Mock(side_effect=self.browser._check_stop)
         self.browser._video_visible = Mock(return_value=True)
+        self.browser._video_quiz_screenshot = Mock(return_value=b"\x89PNG\r\n\x1a\nsynthetic-video-image")
         # These media stubs have no DOM attachment card. Real task markers are
         # exercised by the browser integration fixtures.
         self.browser._task_marker_state = Mock(return_value=None)
@@ -55,6 +56,8 @@ class VideoQuizGuardTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             self.browser.watch_video(on_quiz=callback)
         self.assertIs(raised.exception, error)
+        self.browser._video_quiz_screenshot.assert_called_once_with(root, video)
+        self.assertEqual(callback.call_args.args[1], self.browser._video_quiz_screenshot.return_value)
         self.assertIs(self.browser._questions, old_questions)
         self.assertIs(self.browser._question_controls, old_controls)
         self.browser._pause_video_on_stop.assert_called_once()

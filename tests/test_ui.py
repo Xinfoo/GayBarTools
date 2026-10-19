@@ -117,7 +117,6 @@ class ApplicationTests(unittest.TestCase):
     def test_start_still_requires_valid_configuration(self):
         cases = (
             ({"model": ""}, "模型名称"),
-            ({"vision": False, "ocr": False}, "截图视觉识别或本机 OCR"),
             ({"max_chapters": "0"}, "max_chapters"),
         )
         for values, error_fragment in cases:

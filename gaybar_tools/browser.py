@@ -2646,8 +2646,7 @@ class BrowserSession:
             while True:
                 self._guard()
                 fingerprint = self._question_fingerprint(questions)
-                screenshot = (self._video_quiz_screenshot(root, video)
-                              if correction_feedback or self.settings.vision or self.settings.ocr else None)
+                screenshot = self._video_quiz_screenshot(root, video)
                 self.log(f"正在纠正视频插题（{corrections}/{self.MAX_VIDEO_QUIZ_CORRECTIONS}）。"
                          if correction_feedback else f"检测到视频中途弹题，正在解答 {len(questions)} 道题。")
                 answers = (on_quiz(questions, screenshot, video_quiz_feedback=correction_feedback)
@@ -2795,7 +2794,7 @@ class BrowserSession:
                             started = time.monotonic()
                             self._handle_video_quiz(prompt, video, on_quiz)
                             self._check_stop()
-                            # Model/OCR work is not buffering time or playback time.
+                            # Model work is not buffering time or playback time.
                             deadline += time.monotonic() - started
                             progressed_at, play_requested_at, paused_since = time.monotonic(), 0.0, 0.0
                             continue

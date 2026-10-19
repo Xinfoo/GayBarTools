@@ -75,7 +75,7 @@ class BrowserIntegrationTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.paths = AppPaths.for_root(Path(self.temporary.name)).prepare()
         self.settings = AppSettings(
-            browser_path=self.executable, headless=True, vision=False, ocr=False,
+            browser_path=self.executable, headless=True,
             action_delay_min=0, action_delay_max=0, poll_interval=0.05,
             video_timeout=20, max_chapters=5,
         )
@@ -257,7 +257,6 @@ class BrowserIntegrationTests(unittest.TestCase):
         try:
             self.settings.base_url = f"http://127.0.0.1:{api.server_port}/v1"
             self.settings.model = "local-synthetic-model"
-            self.settings.vision = True
             self.launch()
             self.wait_ready()
             solver = QuizSolver(self.settings, self.logs.append, self.stop)
@@ -306,7 +305,6 @@ class BrowserIntegrationTests(unittest.TestCase):
                 observations.append(browser_test.metrics())
                 return content
 
-        self.settings.vision = True
         self.launch()
         self.wait_ready()
         solver = ObservedSolver(self.settings, self.logs.append, self.stop)
@@ -334,7 +332,6 @@ class BrowserIntegrationTests(unittest.TestCase):
         from gaybar_tools.workflow import Workflow
 
         requests = self.completion_api(lambda _payload, _attempt: '{"answers": []}')
-        self.settings.vision = True
         self.launch("quiz.html?chapterId=1&courseId=demo")
         self.wait_ready()
         current_url = self.browser.page.url
