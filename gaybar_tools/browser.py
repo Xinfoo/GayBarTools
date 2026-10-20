@@ -528,7 +528,7 @@ class BrowserSession:
         self._wait(random.uniform(low, max(low, float(self.settings.action_delay_max))))
 
     def _browser_env(self) -> dict[str, str]:
-        env = os.environ.copy()
+        env = self.paths.environment()
         for path in (self.paths.runtime, self.paths.profile, self.paths.logs,
                      self.paths.screenshots, self.paths.browsers, self.paths.cache, self.paths.tmp):
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -539,12 +539,7 @@ class BrowserSession:
             if self._session_tmp is None:
                 self._session_tmp = tempfile.TemporaryDirectory(prefix="gbt-", dir="/tmp")
             temporary = self._session_tmp.name
-        env.update({"PLAYWRIGHT_BROWSERS_PATH": str(self.paths.browsers),
-                    "TMPDIR": temporary, "TMP": temporary, "TEMP": temporary,
-                    "XDG_CACHE_HOME": str(self.paths.cache),
-                    "XDG_CONFIG_HOME": str(Path(self.paths.runtime) / "config"),
-                    "XDG_DATA_HOME": str(Path(self.paths.runtime) / "data"),
-                    "XDG_STATE_HOME": str(Path(self.paths.runtime) / "state"),
+        env.update({"TMPDIR": temporary, "TMP": temporary, "TEMP": temporary,
                     "BREAKPAD_DUMP_LOCATION": str(Path(temporary) / "crash")})
         return env
 

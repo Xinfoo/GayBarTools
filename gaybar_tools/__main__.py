@@ -40,6 +40,19 @@ def doctor(paths):
         isolation = shutil.which("bwrap")
         print(f"Linux 写入隔离: {isolation or '缺少 bubblewrap (bwrap)'}")
         healthy &= bool(isolation)
+        font_list = shutil.which("fc-list")
+        if font_list:
+            try:
+                result = subprocess.run(
+                    [font_list, ":lang=zh-cn", "--format", "%{family[0]}: %{file}\\n"],
+                    env=paths.environment(), capture_output=True, text=True, timeout=5,
+                )
+                fonts = result.stdout.splitlines()
+                print(f"中文字体: {fonts[0] if fonts else '未发现，请检查系统中文字体安装'}")
+            except (OSError, subprocess.TimeoutExpired):
+                print("中文字体: 无法完成 Fontconfig 检查")
+        else:
+            print("中文字体: 未安装 fc-list，跳过可选检查")
     try:
         from playwright.sync_api import sync_playwright
         settings = AppSettings.load(paths.runtime / "settings.json")

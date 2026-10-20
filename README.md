@@ -100,6 +100,8 @@ Cookie 快照保存在项目内，以原子替换方式更新；Linux 下文件�
 
 进程和浏览器子进程的 XDG 缓存、配置、数据和临时路径均指向项目目录。Linux 额外通过 bubblewrap 将宿主普通文件系统设为只读，持久文件只允许写入项目目录和 `/tmp`，避免 Chromium 访问旧 NSS 证书库时写入用户目录。私有 `/dev` 中会单独保留现有的 DRM/NVIDIA 显卡字符设备，供 Wayland/EGL 和视频渲染使用；不映射整棵宿主 `/dev`，也不把设备目录变成可写的宿主文件目录。隔离不可用时停止启动，不会退回未隔离模式。不会修改 `HOME` 或接管当前浏览器配置。Windows 使用独立会话和项目内缓存路径，尚未做 Windows 实机验证。
 
+Linux 启动时会在 `.runtime/config/fontconfig/conf.d/` 生成字体桥接配置，继续读取原用户目录中的 `fonts` 和 Fontconfig 规则，兼容仅安装到 `~/.local/share/fonts` 或自定义 XDG 目录的中文字体。Qt 界面和浏览器共用这套配置，字体缓存仍写入项目内，无需复制字体或修改系统设置。若两处中文同时显示方框，更新后退出程序及其浏览器再重新启动；`./run.sh --doctor` 可显示当前发现的中文字体。自定义 Fontconfig 主配置需保留对 XDG 用户配置的加载。
+
 开始作答后，题目截图和可读取的题干、选项会统一发送给配置的 LLM API，模型须支持图片输入。全页截图受 iframe 视口裁剪限制，内部屏幕外的纯图片题可能无法完整识别，需要人工处理；DOM 能读取的题干与选项会同时提供给模型。
 
 主要代码：`ui.py` 桌面界面，`worker.py` 浏览器线程，`browser.py` 页面适配，`cookies.py` 登录 Cookie 快照，`workflow.py` 章节状态机，`llm.py` API 与答案校验，`config.py`/`paths.py` 配置和隔离目录。页面结构变化时，应先调整 `browser.py` 并运行本地回归，再验证实际课程。
