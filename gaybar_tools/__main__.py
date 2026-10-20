@@ -57,7 +57,6 @@ def doctor(paths):
     except Exception as exc:
         print(f"浏览器检查: {type(exc).__name__}")
         healthy = False
-    print(f"可选 OCR: {shutil.which('tesseract') or '未安装（可使用视觉模型）'}")
     return 0 if healthy else 1
 
 

@@ -28,7 +28,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_bad_settings_fail_before_browser_launch(self):
         for values in ({"base_url": 3}, {"request_timeout": float("nan")},
-                       {"vision": "false"},
+                       {"headless": "false"},
                        {"max_chapters": 2.5}, {"base_url": "https://u:p@example.test/v1"}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 AppSettings(**values).validate()
@@ -42,6 +42,19 @@ class SettingsTests(unittest.TestCase):
             self.assertFalse(hasattr(settings, "confidence_threshold"))
             settings.save(path)
             self.assertNotIn("confidence_threshold", json.loads(path.read_text()))
+
+    def test_retired_recognition_settings_are_ignored_and_removed_on_save(self):
+        retired = {"vision": False, "ocr": True, "ocr_languages": "chi_sim+eng"}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(json.dumps({"model": "image-model", **retired}))
+            settings = AppSettings.load(path)
+            self.assertEqual(settings.model, "image-model")
+            settings.save(path)
+            saved = json.loads(path.read_text())
+            for name in retired:
+                self.assertFalse(hasattr(settings, name))
+                self.assertNotIn(name, saved)
 
     def test_paths_and_child_cache_stay_under_project(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -98,6 +111,13 @@ class WorkflowTests(unittest.TestCase):
             self.workflow().run()
         self.browser.apply_answers.assert_not_called()
         self.browser.submit_quiz.assert_not_called()
+
+    def test_chapter_quiz_always_supplies_its_screenshot_to_the_model(self):
+        screenshot = b"\x89PNG\r\n\x1a\nchapter-question-image"
+        self.browser.quiz_screenshot.return_value = screenshot
+        self.workflow()._solve_chapter_quiz()
+        self.browser.quiz_screenshot.assert_called_once_with()
+        self.solver.solve.assert_called_once_with(self.browser.get_questions.return_value, screenshot)
 
     def test_stop_during_model_request_prevents_clicks(self):
         def solve(*args):

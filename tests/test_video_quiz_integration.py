@@ -54,7 +54,7 @@ class VideoQuizIntegrationTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.paths = AppPaths.for_root(Path(self.temporary.name)).prepare()
         self.settings = AppSettings(
-            browser_path=self.executable, headless=True, vision=True, ocr=False,
+            browser_path=self.executable, headless=True,
             action_delay_min=0, action_delay_max=0, poll_interval=.05,
             video_timeout=20, max_chapters=2,
         )

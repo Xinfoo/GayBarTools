@@ -14,9 +14,6 @@ class AppSettings:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = ""
-    vision: bool = True
-    ocr: bool = False
-    ocr_languages: str = "chi_sim+eng"
     request_timeout: float = 45.0
     browser_path: str = ""
     action_delay_min: float = 0.35
@@ -28,7 +25,7 @@ class AppSettings:
     remember_key: bool = False
 
     def validate(self, *, require_model: bool = False) -> None:
-        for name in ("base_url", "api_key", "model", "browser_path", "ocr_languages"):
+        for name in ("base_url", "api_key", "model", "browser_path"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"配置 {name} 必须为文本。")
         parsed = urlsplit(self.base_url.strip())
@@ -53,7 +50,7 @@ class AppSettings:
             raise ValueError("学习页面上限必须为整数。")
         if self.action_delay_min > self.action_delay_max:
             raise ValueError("最小点击间隔不能大于最大点击间隔。")
-        for name in ("vision", "ocr", "headless", "remember_key"):
+        for name in ("headless", "remember_key"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"配置 {name} 必须为 true 或 false。")
         if self.browser_path and not Path(self.browser_path).expanduser().is_file():

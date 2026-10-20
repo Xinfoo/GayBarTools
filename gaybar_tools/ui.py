@@ -93,13 +93,9 @@ class Application(QWidget):
         self.entry(form, 1, "模型名称", "model")
         self.entry(form, 2, "API Key", "api_key")
         self.fields["api_key"].setEchoMode(QLineEdit.EchoMode.Password)
-        flags = QHBoxLayout()
-        for text, name in (("发送检测页截图", "vision"), ("本机 OCR", "ocr"),
-                           ("记住密钥（本地明文）", "remember_key")):
-            flags.addWidget(self.check(text, name))
-        flags.addStretch()
-        form.addLayout(flags, 3, 0, 1, 3)
-        form.addWidget(QLabel("开始作答后，题目及勾选的截图会发送至上方 API 地址。"), 4, 0, 1, 3)
+        form.addWidget(self.check("记住密钥（本地明文）", "remember_key"), 3, 0, 1, 3,
+                       Qt.AlignmentFlag.AlignLeft)
+        form.addWidget(QLabel("作答时，题目截图和文字将发送至上方 API 地址，请使用支持图片输入的模型。"), 4, 0, 1, 3)
         layout.addWidget(provider)
 
         runtime = QGroupBox("运行设置")
@@ -188,8 +184,6 @@ class Application(QWidget):
             values[key] = values[key].strip()
         settings = replace(self.settings, **values)
         settings.validate(require_model=require_model and not self.demo_url)
-        if require_model and not self.demo_url and not (settings.vision or settings.ocr):
-            raise ValueError("请至少开启截图视觉识别或本机 OCR。")
         return settings
 
     def save(self):
