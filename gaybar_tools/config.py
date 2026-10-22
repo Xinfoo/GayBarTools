@@ -14,7 +14,7 @@ class AppSettings:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = ""
-    request_timeout: float = 45.0
+    request_timeout: float = 450.0  # Ten times the previous 45s default for slow networks.
     browser_path: str = ""
     action_delay_min: float = 0.35
     action_delay_max: float = 1.0
@@ -36,7 +36,7 @@ class AppSettings:
         if require_model and not self.model.strip():
             raise ValueError("请填写服务商提供的模型名称。")
         for name, low, high in (
-            ("request_timeout", 1, 300),
+            ("request_timeout", 1, 1800),
             ("action_delay_min", 0, 10), ("action_delay_max", 0, 20),
             ("poll_interval", 0.05, 60), ("video_timeout", 1, 86400),
             ("max_chapters", 1, 10000),

@@ -26,6 +26,10 @@ class SettingsTests(unittest.TestCase):
             settings.save(path)
             self.assertNotIn("test-secret", path.read_text())
 
+    def test_default_request_timeout_is_ten_times_the_legacy_value(self):
+        self.assertEqual(AppSettings().request_timeout, 450.0)
+        AppSettings(request_timeout=450.0).validate()
+
     def test_bad_settings_fail_before_browser_launch(self):
         for values in ({"base_url": 3}, {"request_timeout": float("nan")},
                        {"headless": "false"},

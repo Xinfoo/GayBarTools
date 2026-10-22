@@ -11,7 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 from gaybar_tools.config import AppSettings
-from gaybar_tools.llm import AnswerFormatError, QuizSolver, SolverCancelled, SolverError, _SameOriginRedirectHandler, _completion_url
+from gaybar_tools.llm import (AnswerFormatError, QuizSolver, SolverCancelled, SolverError,
+                              SolverTimeout, _SameOriginRedirectHandler, _completion_url)
 from gaybar_tools.models import Answer, Option, Question
 
 
@@ -338,7 +339,6 @@ class QuizSolverTests(unittest.TestCase):
     def test_transport_provider_and_refusal_errors_are_not_retried(self):
         failures = [
             lambda: URLError("private network details"),
-            lambda: socket.timeout("private network details"),
             lambda: HTTPError("http://localhost", 401, "private authentication details", {}, io.BytesIO(b"private")),
             lambda: io.BytesIO(b"invalid provider envelope"),
             lambda: io.BytesIO(json.dumps({"choices": [{"message": {"content": "", "refusal": "private refusal details"}}]}).encode()),
@@ -356,6 +356,43 @@ class QuizSolverTests(unittest.TestCase):
                 self.assertNotIsInstance(caught.exception, AnswerFormatError)
                 self.assertNotIn("private", str(caught.exception))
                 mocked.assert_called_once()
+
+    def test_response_timeout_is_retried_four_times_then_stops(self):
+        with patch("gaybar_tools.llm.request.OpenerDirector.open",
+                   side_effect=socket.timeout("private network details")) as mocked:
+            with self.assertRaises(SolverTimeout) as caught:
+                self.solver.solve([make_question()], PNG)
+        self.assertEqual(mocked.call_count, 5)
+        self.assertIn("重试 4 次", str(caught.exception))
+        self.assertIn("共 5 次请求", str(caught.exception))
+        self.assertNotIn("private", str(caught.exception))
+        self.assertEqual(sum("正在重试" in message for message in self.messages), 4)
+
+    def test_url_error_wrapping_timeout_is_retried_and_can_recover(self):
+        responses = [URLError(socket.timeout("slow")),
+                     api_response(json.dumps({"answers": [answer()]}))]
+
+        def response(*args, **kwargs):
+            value = responses.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=response) as mocked:
+            result = self.solver.solve([make_question()], PNG)
+        self.assertEqual(result[0].choices, ("A",))
+        self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(any("正在重试" in message for message in self.messages))
+
+    def test_stop_during_timeout_prevents_further_retries(self):
+        def response(*args, **kwargs):
+            self.stop.set()
+            raise socket.timeout("slow")
+
+        with patch("gaybar_tools.llm.request.OpenerDirector.open", side_effect=response) as mocked:
+            with self.assertRaises(SolverCancelled):
+                self.solver.solve([make_question()], PNG)
+        self.assertEqual(mocked.call_count, 1)
 
     def test_answers_need_no_confidence_and_prompt_does_not_request_it(self):
         result, mocked = self.solve_with([answer()])

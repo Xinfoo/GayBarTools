@@ -28,6 +28,10 @@ class SolverCancelled(SolverError):
     """The user requested that the current operation stop."""
 
 
+class SolverTimeout(SolverError):
+    """The provider did not respond before every timeout retry was used."""
+
+
 class _SameOriginRedirectHandler(request.HTTPRedirectHandler):
     """A configured provider cannot redirect credentials to another origin."""
 
@@ -78,12 +82,15 @@ class QuizSolver:
 
     The caller must validate the returned choices against the page again before
     clicking. Answer format failures resend the original questions up to three
-    times. Transport errors are not retried. An HTTP request already in flight
-    can take up to request_timeout to observe cancellation.
+    times. A response timeout is retried up to four times before stopping; other
+    transport errors are not retried. An HTTP request already in flight can take
+    up to request_timeout to observe cancellation, and Stop prevents the next
+    timeout retry.
     """
 
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024
     MAX_FORMAT_RETRIES = 3
+    MAX_TIMEOUT_RETRIES = 4
     MAX_VIDEO_QUIZ_FEEDBACK_CHARS = 12_000
 
     def __init__(
@@ -122,40 +129,52 @@ class QuizSolver:
         if self.settings.api_key.strip():
             headers["Authorization"] = f"Bearer {self.settings.api_key.strip()}"
         req = request.Request(endpoint, data=payload, headers=headers, method="POST")
-        try:
-            # Keep the opener local: changing urllib's global opener would also
-            # affect unrelated components and callers in this process.
-            opener = request.build_opener(_SameOriginRedirectHandler())
-            with opener.open(req, timeout=self.settings.request_timeout) as response:
-                data = response.read(self.MAX_RESPONSE_BYTES + 1)
-        except error.HTTPError as exc:
-            exc.close()
+        data: bytes | None = None
+        attempts = self.MAX_TIMEOUT_RETRIES + 1
+        for attempt in range(attempts):
             self._check_cancelled()
-            descriptions = {
-                400: "API 拒绝了请求，请核对模型名称和视觉支持情况。",
-                401: "API 认证失败，请检查 API Key。",
-                403: "API 无访问权限，请检查账户或模型权限。",
-                404: "找不到 API 接口或模型，请核对 Base URL 和模型名称。",
-                408: "API 请求超时。",
-                413: "API 拒绝了过大的截图或请求。",
-                429: "API 限流或额度不足，请稍后重试或检查额度。",
-            }
-            message = descriptions.get(exc.code, "API 服务返回错误，请检查服务状态。")
-            # Provider error bodies may contain the key, prompt, or screenshot.
-            # Do not forward them to the UI or logs.
-            raise SolverError(f"{message}（HTTP {exc.code}）") from None
-        except (TimeoutError, socket.timeout):
-            self._check_cancelled()
-            raise SolverError("API 请求超时，请检查网络或增大超时时间。") from None
-        except error.URLError as exc:
-            self._check_cancelled()
-            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                raise SolverError("API 请求超时，请检查网络或增大超时时间。") from None
-            raise SolverError("无法连接 API，请检查网络、证书和 Base URL。") from None
-        except (OSError, ValueError, http.client.HTTPException):
-            self._check_cancelled()
-            raise SolverError("API 请求失败，请检查地址、网络和请求配置。") from None
+            try:
+                # Keep the opener local: changing urllib's global opener would also
+                # affect unrelated components and callers in this process.
+                opener = request.build_opener(_SameOriginRedirectHandler())
+                with opener.open(req, timeout=self.settings.request_timeout) as response:
+                    data = response.read(self.MAX_RESPONSE_BYTES + 1)
+                break
+            except error.HTTPError as exc:
+                exc.close()
+                self._check_cancelled()
+                descriptions = {
+                    400: "API 拒绝了请求，请核对模型名称和视觉支持情况。",
+                    401: "API 认证失败，请检查 API Key。",
+                    403: "API 无访问权限，请检查账户或模型权限。",
+                    404: "找不到 API 接口或模型，请核对 Base URL 和模型名称。",
+                    408: "API 请求超时。",
+                    413: "API 拒绝了过大的截图或请求。",
+                    429: "API 限流或额度不足，请稍后重试或检查额度。",
+                }
+                message = descriptions.get(exc.code, "API 服务返回错误，请检查服务状态。")
+                # Provider error bodies may contain the key, prompt, or screenshot.
+                # Do not forward them to the UI or logs.
+                raise SolverError(f"{message}（HTTP {exc.code}）") from None
+            except (TimeoutError, socket.timeout, error.URLError) as exc:
+                if isinstance(exc, error.URLError) and not isinstance(
+                        exc.reason, (TimeoutError, socket.timeout)):
+                    self._check_cancelled()
+                    raise SolverError("无法连接 API，请检查网络、证书和 Base URL。") from None
+                self._check_cancelled()
+                if attempt + 1 >= attempts:
+                    raise SolverTimeout(
+                        f"API 请求超时（每次等待 {self.settings.request_timeout:g} 秒），"
+                        f"已重试 {self.MAX_TIMEOUT_RETRIES} 次（共 {attempts} 次请求）仍未收到响应，"
+                        "已停止。请检查网络或增大超时时间。"
+                    ) from None
+                self.log(f"API 请求超时，正在重试（{attempt + 1}/{self.MAX_TIMEOUT_RETRIES}）。")
+            except (OSError, ValueError, http.client.HTTPException):
+                self._check_cancelled()
+                raise SolverError("API 请求失败，请检查地址、网络和请求配置。") from None
         self._check_cancelled()
+        if data is None:
+            raise SolverError("API 请求未返回数据，已停止处理。")
         if len(data) > self.MAX_RESPONSE_BYTES:
             raise SolverError("API 响应过大，已停止处理。")
         try:

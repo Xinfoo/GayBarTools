@@ -148,7 +148,7 @@ class Application(QWidget):
         # Fill spare space without forcing the scroll page to the log's size hint.
         self.logs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout.addWidget(self.logs, 1)
-        footer = QLabel("遇到未识别页面、答案格式重试耗尽或提交异常会停止，并保存诊断截图。")
+        footer = QLabel("遇到未识别页面、答案格式重试耗尽、请求持续超时或提交异常会停止，并保存诊断截图。")
         footer.setWordWrap(True)
         layout.addWidget(footer)
         scroll.setWidget(content)
